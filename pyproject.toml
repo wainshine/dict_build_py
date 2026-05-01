@@ -4,8 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dict-build"
-version = "0.1.0"
+version = "1.0.0"
 description = "Statistical Chinese new word discovery from raw text"
+authors = [{ name = "wainshine" }]
+license = { text = "Apache-2.0" }
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
