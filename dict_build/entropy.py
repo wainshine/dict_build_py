@@ -5,9 +5,7 @@ process each part independently, then merge results.
 """
 
 import math
-import os
 import subprocess
-import tempfile
 from typing import Iterator
 
 

@@ -1,17 +1,23 @@
-"""Pipeline orchestrator for the full word extraction process."""
+"""Pipeline orchestrator for the full word extraction process.
+
+Handles:
+- Normal multi-line files -> multiprocessing
+- Huge single-line files -> sequential direct write
+- Directories of text files -> recursive scan
+"""
 
 import os
 import tempfile
+import subprocess
 from datetime import date
 from multiprocessing import Pool
-from typing import Iterator
 
 import tqdm
 
 from .config import (
     DEFAULT_MAX_LEN, DEFAULT_MEM_MB, WORKERS, MIN_FREQ,
     CHUNK_LINES, WRITE_BATCH, OUTPUT_FILE_SUFFIX,
-    ENTROPY_THRESHOLD, PMI_THRESHOLD, POS_PROB_THRESHOLD,
+    ENTROPY_THRESHOLD,
 )
 from .preprocess import preprocess_line
 from .ngram import generate_ngrams, generate_reverse_ngrams
@@ -27,7 +33,6 @@ from .pos_tag import tag_word
 from .pos_prob import load_pos_prob
 
 TEXT_EXTENSIONS = {".txt", ".csv", ".json", ".sql", ".md", ".html", ".htm"}
-
 SINGLE_LINE_CHAR_CHUNK = 200_000
 BYTE_BUF = 8 * 1024 * 1024
 
@@ -58,7 +63,6 @@ def _make_output_path(input_path: str) -> str:
 
 
 def _is_single_line_file(filepath: str) -> bool:
-    """Check if a file is a huge single-line file."""
     size = os.path.getsize(filepath)
     if size < 100 * 1024 * 1024:
         return False
@@ -72,6 +76,17 @@ def _is_single_line_file(filepath: str) -> bool:
             if count > 10:
                 return False
     return count <= 10
+
+
+def _system_sort(input_path: str, output_path: str, mem_mb: int, parallel: int) -> None:
+    """Sort a text file using system sort(1)."""
+    result = subprocess.run(
+        ["sort", "-S", f"{mem_mb}M", f"--parallel={parallel}",
+         "-o", output_path, input_path],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Sort failed: {result.stderr}")
 
 
 def run_pipeline(
@@ -95,7 +110,6 @@ def run_pipeline(
 
     try:
         print(f"Stage 1-2: Preprocessing + N-gram generation (workers={workers})...")
-
         huge_files = [f for f in txt_files if _is_single_line_file(f)]
         normal_files = [f for f in txt_files if f not in huge_files]
 
@@ -119,21 +133,22 @@ def run_pipeline(
         ngram_bw_sorted = os.path.join(temp_dir, "ngram_backward_sorted.txt")
 
         print("Stage 3: Sorting n-grams (parallel system sort)...")
-        import subprocess as _sp
-        _p1 = _sp.Popen([
+        p1 = subprocess.Popen([
             "sort", "-S", f"{mem_mb}M", f"--parallel={workers}",
             "-o", ngram_fw_sorted, ngram_fw_path,
-        ])
-        _p2 = _sp.Popen([
+        ], stderr=subprocess.PIPE, text=True)
+        p2 = subprocess.Popen([
             "sort", "-S", f"{mem_mb}M", f"--parallel={workers}",
             "-o", ngram_bw_sorted, ngram_bw_path,
-        ])
-        _p1.wait()
-        _p2.wait()
-        if _p1.returncode != 0 or _p2.returncode != 0:
-            raise RuntimeError("Sort failed")
-        for _p in (ngram_fw_path, ngram_bw_path):
-            try: os.remove(_p)
+        ], stderr=subprocess.PIPE, text=True)
+        _, stderr1 = p1.communicate()
+        _, stderr2 = p2.communicate()
+        if p1.returncode != 0:
+            raise RuntimeError(f"Forward sort failed: {stderr1}")
+        if p2.returncode != 0:
+            raise RuntimeError(f"Backward sort failed: {stderr2}")
+        for fp in (ngram_fw_path, ngram_bw_path):
+            try: os.remove(fp)
             except OSError: pass
         print("  Sorting complete")
 
@@ -142,11 +157,15 @@ def run_pipeline(
         left_entropy_file = os.path.join(temp_dir, "left_entropy.txt")
 
         print(f"Stage 4a: Computing right entropy (min_freq={min_freq})...")
-        count = _write_entropy_from_ngram(ngram_fw_sorted, right_entropy_file, min_freq, True)
+        count = _write_entropy_from_ngram(
+            ngram_fw_sorted, right_entropy_file, min_freq, direct=True
+        )
         print(f"  Right: {count} unique words")
 
         print(f"Stage 4b: Computing left entropy (min_freq={min_freq})...")
-        count = _write_entropy_from_ngram(ngram_bw_sorted, left_entropy_unsorted, min_freq, False)
+        count = _write_entropy_from_ngram(
+            ngram_bw_sorted, left_entropy_unsorted, min_freq, direct=False
+        )
         print(f"  Left: {count} unique words")
 
         print("Stage 4c: Sorting left entropy file...")
@@ -161,24 +180,28 @@ def run_pipeline(
         print(f"  Merged: {len(merged)} candidates (entropy >= {ENTROPY_THRESHOLD})")
 
         if not merged:
-            print("  No candidates pass entropy threshold. Writing empty output.")
-            with open(output_path, "w") as f: f.write("word\tfreq\tpmi\tentropy\tpos_prob\tpos\n")
+            print("  No candidates pass entropy threshold.")
+            with open(output_path, "w") as f:
+                f.write("word\tfreq\tpmi\tentropy\tpos_prob\tpos\n")
             return output_path
 
         trie_file = os.path.join(temp_dir, "freq.trie")
         print("Stage 6a: Building frequency trie (stream from file)...")
-        trie, total_single = build_and_mmap_trie(right_entropy_file, trie_file, min_freq=min_freq)
+        trie, total_single = build_and_mmap_trie(
+            right_entropy_file, trie_file, min_freq=min_freq
+        )
         print(f"  Trie ready. Total single-char freq: {total_single}")
 
         print("Stage 6b: Computing PMI and filtering...")
         pos_prob = load_pos_prob(pos_prob_path)
-        results = extract_words(merged, pos_prob, trie, total_single)
-        print(f"  Final words: {len(results)}")
+        results_raw = extract_words(merged, pos_prob, trie, total_single)
+        print(f"  Candidates after PMI/filter: {len(results_raw)}")
 
-        # Attach POS tags
-        for i, (word, freq, pmi, entropy, pp) in enumerate(results):
-            pos = tag_word(word)
-            results[i] = (word, freq, pmi, entropy, pp, pos)
+        # Attach POS tags via list comprehension
+        results = [
+            (w, f, p, e, pp, tag_word(w))
+            for w, f, p, e, pp in results_raw
+        ]
 
         _write_output(results, output_path)
         print(f"Output: {output_path}")
@@ -213,13 +236,15 @@ def _generate_ngrams_parallel(
                 bw_out.writelines(bw_batch)
                 bw_batch.clear()
 
+        # Count chunks in a single pass (avoid double-open)
         total_chunks = 0
-        for f in txt_files:
-            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+        file_chunk_counts: list[tuple[str, int]] = []
+        for fp in txt_files:
+            with open(fp, "r", encoding="utf-8", errors="replace") as fh:
                 lc = sum(1 for _ in fh)
-            total_chunks += (lc + CHUNK_LINES - 1) // CHUNK_LINES
-        if total_chunks == 0:
-            total_chunks = len(txt_files)
+            n = (lc + CHUNK_LINES - 1) // CHUNK_LINES if lc > 0 else 1
+            total_chunks += n
+            file_chunk_counts.append((fp, n))
 
         with Pool(processes=workers) as pool:
             pbar = tqdm.tqdm(total=total_chunks, desc="  N-grams", unit="chunk")
@@ -242,7 +267,7 @@ def _generate_ngrams_parallel(
             pool.join()
 
 
-def _read_chunks_by_lines(path: str, n: int) -> Iterator[list[str]]:
+def _read_chunks_by_lines(path: str, n: int):
     chunk: list[str] = []
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -266,7 +291,7 @@ def _process_chunk(lines: list[str], max_len: int) -> tuple[list[str], list[str]
     return fw, bw
 
 
-# ---- N-gram generation: huge single-line files (sequential, no serialization) ----
+# ---- N-gram generation: huge single-line files (sequential) ----
 
 def _generate_ngrams_single_line(
     filepath: str,
@@ -274,12 +299,6 @@ def _generate_ngrams_single_line(
     ngram_bw_path: str,
     max_len: int,
 ) -> None:
-    """Process a huge single-line file by:
-    1. Reading in 8MB binary blocks
-    2. Slicing decoded text into ~200K char segments
-    3. Preprocessing + n-gram generation inline (no multiprocessing)
-    4. Writing n-grams directly to output files
-    """
     fw_out = open(ngram_fw_path, "a", encoding="utf-8")
     bw_out = open(ngram_bw_path, "a", encoding="utf-8")
 
@@ -322,42 +341,36 @@ def _generate_ngrams_single_line(
     bw_out.close()
 
 
-def _process_text_segment(
-    text: str,
-    max_len: int,
-    fw_out,
-    bw_out,
-) -> None:
-    """Preprocess a text segment and write n-grams directly to files."""
-    fw_lines: list[str] = []
-    bw_lines: list[str] = []
-
+def _process_text_segment(text: str, max_len: int, fw_out, bw_out) -> None:
+    """Preprocess a text segment and write n-grams directly."""
     for sent in preprocess_line(text):
         for ng in generate_ngrams(sent, max_len):
-            fw_lines.append(ng + "\n")
+            fw_out.write(ng)
+            fw_out.write("\n")
         for ng in generate_reverse_ngrams(sent, max_len):
-            bw_lines.append(ng + "\n")
-
-    if fw_lines:
-        fw_out.writelines(fw_lines)
-    if bw_lines:
-        bw_out.writelines(bw_lines)
+            bw_out.write(ng)
+            bw_out.write("\n")
 
 
 # ---- Entropy helpers ----
 
-def _write_entropy_from_ngram(ng: str, out: str, mf: int, d: bool) -> int:
-    with open(ng, "r", encoding="utf-8", buffering=16 * 1024 * 1024) as fin:
-        gen = compute_entropy_from_sorted(fin, min_freq=mf) if d \
-             else compute_entropy_from_sorted_left(fin, min_freq=mf)
-        return write_entropy_to_file(gen, out)
+def _write_entropy_from_ngram(
+    ngram_file: str,
+    output_file: str,
+    min_freq: int,
+    direct: bool,
+) -> int:
+    with open(ngram_file, "r", encoding="utf-8", buffering=16 * 1024 * 1024) as fin:
+        gen = compute_entropy_from_sorted(fin, min_freq=min_freq) if direct \
+             else compute_entropy_from_sorted_left(fin, min_freq=min_freq)
+        pbar = tqdm.tqdm(gen, desc="    Entropy", unit="words", unit_scale=True)
+        return write_entropy_to_file(pbar, output_file)
 
 
 # ---- Output ----
 
-def _write_output(res: list, path: str) -> None:
+def _write_output(results: list, path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         f.write("word\tfreq\tpmi\tentropy\tpos_prob\tpos\n")
-        for row in res:
-            w, fr, p, e, pp, pos = row
+        for w, fr, p, e, pp, pos in results:
             f.write(f"{w}\t{fr}\t{p:.6f}\t{e:.6f}\t{pp:.6f}\t{pos}\n")

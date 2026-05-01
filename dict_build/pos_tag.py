@@ -34,9 +34,3 @@ def tag_word(word: str) -> str:
         r=pronoun, x=unknown, etc.
     """
     return _get_pos_dict().get(word, "x")
-
-
-def tag_words(words: list[str]) -> list[str]:
-    """Tag a list of words, returning list of POS tags."""
-    d = _get_pos_dict()
-    return [d.get(w, "x") for w in words]

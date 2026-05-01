@@ -30,15 +30,6 @@ def generate_ngrams(sentence: str, max_len: int = 6) -> Iterator[str]:
             yield word + "\t" + next_char
 
 
-def generate_ngrams_direct(sentence: str, max_len: int = 6) -> Iterator[str]:
-    """Generate n-grams as words only (no suffix info)."""
-    n = len(sentence)
-    for i in range(1, n - 1):
-        max_j = min(max_len, n - i - 1)
-        for j in range(1, max_j + 1):
-            yield sentence[i:i + j]
-
-
 def generate_reverse_ngrams(sentence: str, max_len: int = 6) -> Iterator[str]:
     """Generate n-grams from reversed sentence content (for left entropy).
 

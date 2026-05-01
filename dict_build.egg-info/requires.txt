@@ -1,7 +1,0 @@
-numpy>=2.0
-marisa-trie>=1.0
-tqdm>=4.0
-click>=8.0
-
-[dev]
-pytest>=8.0

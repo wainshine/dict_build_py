@@ -5,8 +5,6 @@ Trie is built from file, saved to disk, then loaded via mmap.
 """
 
 import math
-import os
-from typing import Iterator
 
 import marisa_trie
 

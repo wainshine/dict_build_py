@@ -50,10 +50,10 @@ def main(
 ) -> None:
     """Extract Chinese words/phrases from raw text using statistical NLP.
 
-    INPUT_PATH can be a .txt file or a directory containing .txt files.
+    INPUT_PATH can be a .txt file or a directory containing text files.
 
     Output format (tab-separated, sorted by frequency desc):
-        word    frequency    pmi    entropy    position_probability
+        word    freq    pmi    entropy    pos_prob    pos
     """
     import dict_build.config as cfg
     cfg.PMI_THRESHOLD = pmi_threshold

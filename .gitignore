@@ -1,0 +1,11 @@
+__pycache__/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+*.pyc
+*.pyo
+.DS_Store
+*.trie
+words_sort.data
+*_words_sort.data

@@ -7,9 +7,8 @@ name = "dict-build"
 version = "0.1.0"
 description = "Statistical Chinese new word discovery from raw text"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.10"
 dependencies = [
-    "numpy>=2.0",
     "marisa-trie>=1.0",
     "tqdm>=4.0",
     "click>=8.0",
