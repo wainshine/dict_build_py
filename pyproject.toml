@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=75.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dict-build"
+version = "0.1.0"
+description = "Statistical Chinese new word discovery from raw text"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.0",
+    "marisa-trie>=1.0",
+    "tqdm>=4.0",
+    "click>=8.0",
+    "jieba>=0.42",
+    "regex>=2024.0",
+]
+
+[project.scripts]
+dict-build = "dict_build.__main__:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools]
+packages = ["dict_build"]

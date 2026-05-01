@@ -1,0 +1,2 @@
+[console_scripts]
+dict-build = dict_build.__main__:main
