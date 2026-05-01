@@ -29,7 +29,7 @@ def compute_entropy_from_sorted(
         if tab_pos < 0:
             continue
         word = line[:tab_pos]
-        suffix = line[tab_pos + 1:-1] if line.endswith("\n") else line[tab_pos + 1:]
+        suffix = line[tab_pos + 1:].rstrip("\n\r")
         if not word:
             continue
 

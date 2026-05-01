@@ -7,8 +7,8 @@ Trie is built from file, saved to disk, then loaded via mmap.
 import math
 
 import marisa_trie
+import tqdm
 
-from .config import PMI_THRESHOLD, ENTROPY_THRESHOLD, POS_PROB_THRESHOLD
 from .preprocess import is_chinese
 from .entropy import read_entropy_from_file
 
@@ -88,18 +88,17 @@ def extract_words(
     pos_prob: dict[str, tuple[float, float, float]],
     trie: marisa_trie.RecordTrie,
     total_single: int,
-    pmi_threshold: float = PMI_THRESHOLD,
-    entropy_threshold: float = ENTROPY_THRESHOLD,
-    pos_threshold: float = POS_PROB_THRESHOLD,
+    pmi_threshold: float,
+    entropy_threshold: float,
+    pos_threshold: float,
 ) -> list[tuple[str, int, float, float, float]]:
     """Filter and score candidate words.
 
     Returns list of (word, freq, pmi, entropy, pos_prob) sorted by freq desc.
     """
-    tqdm_mod = _tqdm()
     results: list[tuple[str, int, float, float, float]] = []
 
-    for word, freq, entropy in tqdm_mod.tqdm(
+    for word, freq, entropy in tqdm.tqdm(
         merged_data, desc="  Computing PMI", unit="words"
     ):
         if len(word) < 2:
@@ -125,7 +124,3 @@ def extract_words(
     results.sort(key=lambda x: x[1], reverse=True)
     return results
 
-
-def _tqdm():
-    import tqdm
-    return tqdm

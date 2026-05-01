@@ -9,3 +9,7 @@ build/
 *.trie
 words_sort.data
 *_words_sort.data
+venv/
+.venv/
+.coverage
+*.log

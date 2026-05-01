@@ -20,14 +20,6 @@ def preprocess_line(line: str) -> Iterator[str]:
             yield SENTINEL + token + SENTINEL
 
 
-def preprocess_file_lines(lines: list[str]) -> list[str]:
-    """Process a chunk of lines, return list of Chinese sentences."""
-    result: list[str] = []
-    for line in lines:
-        result.extend(preprocess_line(line))
-    return result
-
-
 def is_chinese(char: str) -> bool:
     """Check if a single character is in the Chinese Unicode range."""
     return 0x4E00 <= ord(char) <= 0x9FA5

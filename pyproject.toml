@@ -24,3 +24,6 @@ dev = ["pytest>=8.0"]
 
 [tool.setuptools]
 packages = ["dict_build"]
+
+[tool.setuptools.package-data]
+"dict_build" = ["data/pos_prop.txt"]

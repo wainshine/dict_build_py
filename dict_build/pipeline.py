@@ -7,6 +7,7 @@ Handles:
 """
 
 import os
+import shutil
 import time
 import threading
 import subprocess
@@ -18,8 +19,7 @@ import tqdm
 
 from .config import (
     DEFAULT_MAX_LEN, DEFAULT_MEM_MB, WORKERS, MIN_FREQ,
-    CHUNK_LINES, WRITE_BATCH, OUTPUT_FILE_SUFFIX,
-    ENTROPY_THRESHOLD,
+    CHUNK_LINES, OUTPUT_FILE_SUFFIX,
 )
 from .preprocess import preprocess_line
 from .ngram import generate_ngrams, generate_reverse_ngrams
@@ -185,6 +185,10 @@ def run_pipeline(
         sort_file_inplace(left_entropy_unsorted)
         os.rename(left_entropy_unsorted, left_entropy_file)
 
+        from dict_build.config import (
+            ENTROPY_THRESHOLD, PMI_THRESHOLD, POS_PROB_THRESHOLD,
+        )
+
         print("Stage 5: Merging left and right entropy...")
         merged = merge_entropy_files_sorted(
             right_entropy_file, left_entropy_file,
@@ -207,7 +211,12 @@ def run_pipeline(
 
         print("Stage 6b: Computing PMI and filtering...")
         pos_prob = load_pos_prob(pos_prob_path)
-        results_raw = extract_words(merged, pos_prob, trie, total_single)
+        results_raw = extract_words(
+            merged, pos_prob, trie, total_single,
+            pmi_threshold=PMI_THRESHOLD,
+            entropy_threshold=ENTROPY_THRESHOLD,
+            pos_threshold=POS_PROB_THRESHOLD,
+        )
         print(f"  Candidates after PMI/filter: {len(results_raw)}")
 
         # Attach POS tags via list comprehension
@@ -221,7 +230,6 @@ def run_pipeline(
         return output_path
 
     finally:
-        import shutil
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -234,50 +242,88 @@ def _generate_ngrams_parallel(
     max_len: int,
     workers: int,
 ) -> None:
-    with open(ngram_fw_path, "a", encoding="utf-8") as fw_out, \
-         open(ngram_bw_path, "a", encoding="utf-8") as bw_out:
+    """Generate n-grams with multiprocessing, writing directly to temp files.
 
-        fw_batch: list[str] = []
-        bw_batch: list[str] = []
+    Each worker writes its chunk output to a unique temp file pair.
+    Results are never pickled back; the main process only concatenates.
+    """
+    ngram_tmp_dir = tempfile.mkdtemp(prefix="dict_build_ngrams_")
 
-        def flush():
-            nonlocal fw_batch, bw_batch
-            if fw_batch:
-                fw_out.writelines(fw_batch)
-                fw_batch.clear()
-            if bw_batch:
-                bw_out.writelines(bw_batch)
-                bw_batch.clear()
+    total_chunks = 0
+    for fp in txt_files:
+        with open(fp, "r", encoding="utf-8", errors="replace") as fh:
+            lc = sum(1 for _ in fh)
+        total_chunks += (lc + CHUNK_LINES - 1) // CHUNK_LINES if lc > 0 else 1
 
-        # Count chunks in a single pass (avoid double-open)
-        total_chunks = 0
-        file_chunk_counts: list[tuple[str, int]] = []
-        for fp in txt_files:
-            with open(fp, "r", encoding="utf-8", errors="replace") as fh:
-                lc = sum(1 for _ in fh)
-            n = (lc + CHUNK_LINES - 1) // CHUNK_LINES if lc > 0 else 1
-            total_chunks += n
-            file_chunk_counts.append((fp, n))
+    max_pending = workers * 4
+    fw_tmp_paths: list[str] = []
+    bw_tmp_paths: list[str] = []
 
+    try:
         with Pool(processes=workers) as pool:
             pbar = tqdm.tqdm(total=total_chunks, desc="  N-grams", unit="chunk")
+            futures: list = []
+            chunk_id = 0
+
             for txt_file in txt_files:
                 for chunk in _read_chunks_by_lines(txt_file, CHUNK_LINES):
-                    fut = pool.apply_async(_process_chunk, (chunk, max_len))
-                    try:
-                        fw, bw = fut.get()
-                    except Exception:
-                        pool.terminate()
-                        raise
-                    fw_batch.extend(fw)
-                    bw_batch.extend(bw)
-                    if len(fw_batch) >= WRITE_BATCH:
-                        flush()
-                    pbar.update(1)
-            flush()
+                    fw_tmp = os.path.join(ngram_tmp_dir, f"fw_{chunk_id:08d}.txt")
+                    bw_tmp = os.path.join(ngram_tmp_dir, f"bw_{chunk_id:08d}.txt")
+                    fw_tmp_paths.append(fw_tmp)
+                    bw_tmp_paths.append(bw_tmp)
+
+                    if len(futures) >= max_pending:
+                        futures.pop(0).get()
+                        pbar.update(1)
+
+                    futures.append(pool.apply_async(
+                        _process_chunk_direct,
+                        (chunk, max_len, fw_tmp, bw_tmp),
+                    ))
+                    chunk_id += 1
+
+            for fut in futures:
+                try:
+                    fut.get()
+                except Exception:
+                    pool.terminate()
+                    raise
+                pbar.update(1)
             pbar.close()
-            pool.close()
-            pool.join()
+
+        for out_path, tmp_paths in [
+            (ngram_fw_path, fw_tmp_paths),
+            (ngram_bw_path, bw_tmp_paths),
+        ]:
+            with open(out_path, "wb") as out:
+                for tp in tmp_paths:
+                    with open(tp, "rb") as f:
+                        shutil.copyfileobj(f, out)
+    finally:
+        shutil.rmtree(ngram_tmp_dir, ignore_errors=True)
+
+
+def _process_chunk_direct(
+    lines: list[str],
+    max_len: int,
+    fw_path: str,
+    bw_path: str,
+) -> None:
+    """Process a chunk of lines, write n-grams directly to temp files.
+
+    No n-gram lists are accumulated in memory; each fragment is written
+    immediately. Worker memory = chunk text + file buffer (~ few MB).
+    """
+    with open(fw_path, "w", encoding="utf-8") as fw, \
+         open(bw_path, "w", encoding="utf-8") as bw:
+        for line in lines:
+            for sent in preprocess_line(line):
+                for ng in generate_ngrams(sent, max_len):
+                    fw.write(ng)
+                    fw.write("\n")
+                for ng in generate_reverse_ngrams(sent, max_len):
+                    bw.write(ng)
+                    bw.write("\n")
 
 
 def _read_chunks_by_lines(path: str, n: int):
@@ -290,18 +336,6 @@ def _read_chunks_by_lines(path: str, n: int):
                 chunk = []
         if chunk:
             yield chunk
-
-
-def _process_chunk(lines: list[str], max_len: int) -> tuple[list[str], list[str]]:
-    fw: list[str] = []
-    bw: list[str] = []
-    for line in lines:
-        for sent in preprocess_line(line):
-            for ng in generate_ngrams(sent, max_len):
-                fw.append(ng + "\n")
-            for ng in generate_reverse_ngrams(sent, max_len):
-                bw.append(ng + "\n")
-    return fw, bw
 
 
 # ---- N-gram generation: huge single-line files (sequential) ----
@@ -343,6 +377,9 @@ def _generate_ngrams_single_line(
                         break
                     except UnicodeDecodeError:
                         continue
+                else:
+                    text = segment.decode("utf-8", errors="replace")
+                    carryover = b""
 
             for i in range(0, len(text), SINGLE_LINE_CHAR_CHUNK):
                 sub = text[i:i + SINGLE_LINE_CHAR_CHUNK]
