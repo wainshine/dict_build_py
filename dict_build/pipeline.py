@@ -348,47 +348,48 @@ def _generate_ngrams_single_line(
 ) -> None:
     fw_out = open(ngram_fw_path, "a", encoding="utf-8")
     bw_out = open(ngram_bw_path, "a", encoding="utf-8")
+    try:
+        total_chars = os.path.getsize(filepath) // 3
+        total_chunks = (total_chars + SINGLE_LINE_CHAR_CHUNK - 1) // SINGLE_LINE_CHAR_CHUNK
+        pbar = tqdm.tqdm(total=total_chunks, desc="  S-line", unit="chunk")
 
-    total_chars = os.path.getsize(filepath) // 3
-    total_chunks = (total_chars + SINGLE_LINE_CHAR_CHUNK - 1) // SINGLE_LINE_CHAR_CHUNK
-    pbar = tqdm.tqdm(total=total_chunks, desc="  S-line", unit="chunk")
+        carryover = b""
+        with open(filepath, "rb") as fin:
+            while True:
+                data = fin.read(BYTE_BUF)
+                if not data:
+                    if carryover:
+                        _process_text_segment(
+                            carryover.decode("utf-8", errors="replace"),
+                            max_len, fw_out, bw_out
+                        )
+                    break
 
-    carryover = b""
-    with open(filepath, "rb") as fin:
-        while True:
-            data = fin.read(BYTE_BUF)
-            if not data:
-                if carryover:
-                    _process_text_segment(
-                        carryover.decode("utf-8", errors="replace"),
-                        max_len, fw_out, bw_out
-                    )
-                break
-
-            segment = carryover + data
-            try:
-                text = segment.decode("utf-8")
-                carryover = b""
-            except UnicodeDecodeError:
-                for cut in range(-1, -5, -1):
-                    try:
-                        text = segment[:cut].decode("utf-8")
-                        carryover = segment[cut:]
-                        break
-                    except UnicodeDecodeError:
-                        continue
-                else:
-                    text = segment.decode("utf-8", errors="replace")
+                segment = carryover + data
+                try:
+                    text = segment.decode("utf-8")
                     carryover = b""
+                except UnicodeDecodeError:
+                    for cut in range(-1, -5, -1):
+                        try:
+                            text = segment[:cut].decode("utf-8")
+                            carryover = segment[cut:]
+                            break
+                        except UnicodeDecodeError:
+                            continue
+                    else:
+                        text = segment.decode("utf-8", errors="replace")
+                        carryover = b""
 
-            for i in range(0, len(text), SINGLE_LINE_CHAR_CHUNK):
-                sub = text[i:i + SINGLE_LINE_CHAR_CHUNK]
-                _process_text_segment(sub, max_len, fw_out, bw_out)
-                pbar.update(1)
+                for i in range(0, len(text), SINGLE_LINE_CHAR_CHUNK):
+                    sub = text[i:i + SINGLE_LINE_CHAR_CHUNK]
+                    _process_text_segment(sub, max_len, fw_out, bw_out)
+                    pbar.update(1)
 
-    pbar.close()
-    fw_out.close()
-    bw_out.close()
+        pbar.close()
+    finally:
+        fw_out.close()
+        bw_out.close()
 
 
 def _process_text_segment(text: str, max_len: int, fw_out, bw_out) -> None:

@@ -191,7 +191,7 @@ dict_build_py/
 │   ├── pipeline.py       # 流程编排
 │   └── data/pos_prop.txt # 位置成词概率数据
 └── tests/
-    └── test_extract.py   # 9 个单元测试
+    └── test_extract.py   # 38 个单元测试
 ```
 
 ## 与 dict_build (Java) 版本的差异

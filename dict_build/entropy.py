@@ -6,6 +6,7 @@ process each part independently, then merge results.
 
 import math
 import os
+import shutil
 import subprocess
 from typing import Iterator
 
@@ -108,7 +109,6 @@ def read_entropy_from_file(filepath: str) -> Iterator[tuple[str, int, float]]:
 
 def sort_file_inplace(filepath: str) -> None:
     """Sort a file in-place using system sort."""
-    import shutil
     if shutil.which("sort") is not None:
         subprocess.run(
             ["sort", "-o", filepath, filepath],
