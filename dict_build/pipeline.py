@@ -7,8 +7,10 @@ Handles:
 """
 
 import os
-import tempfile
+import time
+import threading
 import subprocess
+import tempfile
 from datetime import date
 from multiprocessing import Pool
 
@@ -78,17 +80,6 @@ def _is_single_line_file(filepath: str) -> bool:
     return count <= 10
 
 
-def _system_sort(input_path: str, output_path: str, mem_mb: int, parallel: int) -> None:
-    """Sort a text file using system sort(1)."""
-    result = subprocess.run(
-        ["sort", "-S", f"{mem_mb}M", f"--parallel={parallel}",
-         "-o", output_path, input_path],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Sort failed: {result.stderr}")
-
-
 def run_pipeline(
     input_path: str,
     output_path: str | None = None,
@@ -132,17 +123,38 @@ def run_pipeline(
         ngram_fw_sorted = os.path.join(temp_dir, "ngram_forward_sorted.txt")
         ngram_bw_sorted = os.path.join(temp_dir, "ngram_backward_sorted.txt")
 
-        print("Stage 3: Sorting n-grams (parallel system sort)...")
+        print("Stage 3: Sorting n-grams (LC_ALL=C for speed)...")
+        sort_env = {**os.environ, "LC_ALL": "C"}
         p1 = subprocess.Popen([
             "sort", "-S", f"{mem_mb}M", f"--parallel={workers}",
             "-o", ngram_fw_sorted, ngram_fw_path,
-        ], stderr=subprocess.PIPE, text=True)
+        ], stderr=subprocess.PIPE, text=True, env=sort_env)
         p2 = subprocess.Popen([
             "sort", "-S", f"{mem_mb}M", f"--parallel={workers}",
             "-o", ngram_bw_sorted, ngram_bw_path,
-        ], stderr=subprocess.PIPE, text=True)
+        ], stderr=subprocess.PIPE, text=True, env=sort_env)
+
+        fw_in_size = os.path.getsize(ngram_fw_path)
+        bw_in_size = os.path.getsize(ngram_bw_path)
+        total_in = fw_in_size + bw_in_size
+
+        def _monitor():
+            while p1.poll() is None or p2.poll() is None:
+                fw_out = os.path.getsize(ngram_fw_sorted) if os.path.exists(ngram_fw_sorted) else 0
+                bw_out = os.path.getsize(ngram_bw_sorted) if os.path.exists(ngram_bw_sorted) else 0
+                pct = (fw_out + bw_out) / total_in * 100 if total_in > 0 else 0
+                elapsed = time.time() - _monitor.t0
+                print(f"\r  Sorting... {pct:.0f}% ({elapsed:.0f}s)", end="", flush=True)
+                time.sleep(3)
+            elapsed = time.time() - _monitor.t0
+            print(f"\r  Sorting... 100% ({elapsed:.0f}s)", flush=True)
+        _monitor.t0 = time.time()
+        t = threading.Thread(target=_monitor, daemon=True)
+        t.start()
+
         _, stderr1 = p1.communicate()
         _, stderr2 = p2.communicate()
+        t.join(timeout=1)
         if p1.returncode != 0:
             raise RuntimeError(f"Forward sort failed: {stderr1}")
         if p2.returncode != 0:
@@ -150,6 +162,7 @@ def run_pipeline(
         for fp in (ngram_fw_path, ngram_bw_path):
             try: os.remove(fp)
             except OSError: pass
+        print()
         print("  Sorting complete")
 
         right_entropy_file = os.path.join(temp_dir, "right_entropy.txt")

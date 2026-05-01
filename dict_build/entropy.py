@@ -5,6 +5,7 @@ process each part independently, then merge results.
 """
 
 import math
+import os
 import subprocess
 from typing import Iterator
 
@@ -109,11 +110,15 @@ def sort_file_inplace(filepath: str) -> None:
     """Sort a file in-place using system sort."""
     import shutil
     if shutil.which("sort") is not None:
-        subprocess.run(["sort", "-o", filepath, filepath], check=True)
+        subprocess.run(
+            ["sort", "-o", filepath, filepath],
+            check=True,
+            env={**os.environ, "LC_ALL": "C"},
+        )
     else:
         with open(filepath, "r", encoding="utf-8") as f:
             lines = f.readlines()
-        lines.sort()
+        lines.sort(key=lambda s: s.encode("utf-8"))
         with open(filepath, "w", encoding="utf-8") as f:
             f.writelines(lines)
 
