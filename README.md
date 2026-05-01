@@ -206,3 +206,9 @@ dict_build_py/
 | 内存优化 | ConcurrentRadixTree | marisa-trie + mmap 零拷贝加载 |
 | 输出位置 | 原文件同目录 | 同目录 + 日期后缀 |
 | 算法 | N-gram + PMI + 左右熵 + 位置概率 | 完全一致 |
+
+
+---
+
+wainshine
+2026.05.01
