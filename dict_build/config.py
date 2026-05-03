@@ -11,6 +11,7 @@ ENTROPY_THRESHOLD = 2.0
 POS_PROB_THRESHOLD = 0.1
 WORKERS = max(1, cpu_count() // 2)
 CHUNK_LINES = 5_000
+CHUNKS_PER_BATCH = 20
 SENTINEL = "$"
 
 STOPWORDS = set("的很了么呢是嘛个都也比还这于不与才上用就好在和对挺去后没说")

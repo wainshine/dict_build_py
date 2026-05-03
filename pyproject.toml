@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dict-build"
-version = "1.0.0"
+version = "1.1.0"
 description = "Statistical Chinese new word discovery from raw text"
 authors = [{ name = "wainshine" }]
 license = { text = "Apache-2.0" }
@@ -16,6 +16,7 @@ dependencies = [
     "click>=8.0",
     "jieba>=0.42",
     "regex>=2024.0",
+    "charset-normalizer>=3.0",
 ]
 
 [project.scripts]

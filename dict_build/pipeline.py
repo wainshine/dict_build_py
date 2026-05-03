@@ -19,7 +19,7 @@ import tqdm
 
 from .config import (
     DEFAULT_MAX_LEN, DEFAULT_MEM_MB, WORKERS, MIN_FREQ,
-    CHUNK_LINES, OUTPUT_FILE_SUFFIX,
+    CHUNK_LINES, CHUNKS_PER_BATCH, OUTPUT_FILE_SUFFIX,
 )
 from .preprocess import preprocess_line
 from .ngram import generate_ngrams, generate_reverse_ngrams
@@ -37,6 +37,17 @@ from .pos_prob import load_pos_prob
 TEXT_EXTENSIONS = {".txt", ".csv", ".json", ".sql", ".md", ".html", ".htm"}
 SINGLE_LINE_CHAR_CHUNK = 200_000
 BYTE_BUF = 8 * 1024 * 1024
+
+
+def _detect_file_encoding(filepath: str) -> str:
+    """Detect the encoding of a text file, fallback to utf-8."""
+    try:
+        import charset_normalizer
+        result = charset_normalizer.from_path(filepath)
+        enc = result.best().encoding
+        return enc if enc else "utf-8"
+    except Exception:
+        return "utf-8"
 
 
 def _collect_files(path: str) -> list[str]:
@@ -90,7 +101,12 @@ def run_pipeline(
     pos_prob_path: str | None = None,
 ) -> str:
     txt_files = _collect_files(input_path)
-    print(f"Found {len(txt_files)} text file(s) to process")
+    total_size = sum(os.path.getsize(fp) for fp in txt_files)
+    print(f"Found {len(txt_files)} text file(s) to process "
+          f"({total_size / 1e9:.1f} GB)")
+    if total_size > 2 * 1024 * 1024 * 1024:
+        print(f"  ⚠ Input > 2 GB, processing may take a long time."
+              f" Consider --min-freq higher or sample first.")
 
     if output_path is None:
         output_path = _make_output_path(input_path)
@@ -169,16 +185,30 @@ def run_pipeline(
         left_entropy_unsorted = os.path.join(temp_dir, "left_entropy_unsorted.txt")
         left_entropy_file = os.path.join(temp_dir, "left_entropy.txt")
 
+        PARALLEL_ENTROPY_THRESHOLD = 1024 * 1024 * 1024  # 1GB
+
         print(f"Stage 4a: Computing right entropy (min_freq={min_freq})...")
-        count = _write_entropy_from_ngram(
-            ngram_fw_sorted, right_entropy_file, min_freq, direct=True
-        )
+        if os.path.getsize(ngram_fw_sorted) > PARALLEL_ENTROPY_THRESHOLD:
+            count = _write_entropy_from_ngram_parallel(
+                ngram_fw_sorted, right_entropy_file, min_freq,
+                direct=True, workers=workers,
+            )
+        else:
+            count = _write_entropy_from_ngram(
+                ngram_fw_sorted, right_entropy_file, min_freq, direct=True,
+            )
         print(f"  Right: {count} unique words")
 
         print(f"Stage 4b: Computing left entropy (min_freq={min_freq})...")
-        count = _write_entropy_from_ngram(
-            ngram_bw_sorted, left_entropy_unsorted, min_freq, direct=False
-        )
+        if os.path.getsize(ngram_bw_sorted) > PARALLEL_ENTROPY_THRESHOLD:
+            count = _write_entropy_from_ngram_parallel(
+                ngram_bw_sorted, left_entropy_unsorted, min_freq,
+                direct=False, workers=workers,
+            )
+        else:
+            count = _write_entropy_from_ngram(
+                ngram_bw_sorted, left_entropy_unsorted, min_freq, direct=False,
+            )
         print(f"  Left: {count} unique words")
 
         print("Stage 4c: Sorting left entropy file...")
@@ -250,8 +280,11 @@ def _generate_ngrams_parallel(
     ngram_tmp_dir = tempfile.mkdtemp(prefix="dict_build_ngrams_")
 
     total_chunks = 0
+    file_encodings: dict[str, str] = {}
     for fp in txt_files:
-        with open(fp, "r", encoding="utf-8", errors="replace") as fh:
+        enc = _detect_file_encoding(fp)
+        file_encodings[fp] = enc
+        with open(fp, "r", encoding=enc, errors="replace") as fh:
             lc = sum(1 for _ in fh)
         total_chunks += (lc + CHUNK_LINES - 1) // CHUNK_LINES if lc > 0 else 1
 
@@ -263,24 +296,43 @@ def _generate_ngrams_parallel(
         with Pool(processes=workers) as pool:
             pbar = tqdm.tqdm(total=total_chunks, desc="  N-grams", unit="chunk")
             futures: list = []
-            chunk_id = 0
+            batch_id = 0
+            batch_lines: list[str] = []
+            batch_chunks: int = 0
 
             for txt_file in txt_files:
-                for chunk in _read_chunks_by_lines(txt_file, CHUNK_LINES):
-                    fw_tmp = os.path.join(ngram_tmp_dir, f"fw_{chunk_id:08d}.txt")
-                    bw_tmp = os.path.join(ngram_tmp_dir, f"bw_{chunk_id:08d}.txt")
-                    fw_tmp_paths.append(fw_tmp)
-                    bw_tmp_paths.append(bw_tmp)
+                enc = file_encodings[txt_file]
+                for chunk in _read_chunks_by_lines(txt_file, CHUNK_LINES, encoding=enc):
+                    batch_lines.extend(chunk)
+                    batch_chunks += 1
 
-                    if len(futures) >= max_pending:
-                        futures.pop(0).get()
-                        pbar.update(1)
+                    if batch_chunks >= CHUNKS_PER_BATCH:
+                        fw_tmp = os.path.join(ngram_tmp_dir, f"fw_{batch_id:06d}.txt")
+                        bw_tmp = os.path.join(ngram_tmp_dir, f"bw_{batch_id:06d}.txt")
+                        fw_tmp_paths.append(fw_tmp)
+                        bw_tmp_paths.append(bw_tmp)
 
-                    futures.append(pool.apply_async(
-                        _process_chunk_direct,
-                        (chunk, max_len, fw_tmp, bw_tmp),
-                    ))
-                    chunk_id += 1
+                        if len(futures) >= max_pending:
+                            futures.pop(0).get()
+                            pbar.update(batch_chunks)
+
+                        futures.append(pool.apply_async(
+                            _process_chunk_direct,
+                            (batch_lines, max_len, fw_tmp, bw_tmp),
+                        ))
+                        batch_id += 1
+                        batch_lines = []
+                        batch_chunks = 0
+
+            if batch_lines:
+                fw_tmp = os.path.join(ngram_tmp_dir, f"fw_{batch_id:06d}.txt")
+                bw_tmp = os.path.join(ngram_tmp_dir, f"bw_{batch_id:06d}.txt")
+                fw_tmp_paths.append(fw_tmp)
+                bw_tmp_paths.append(bw_tmp)
+                futures.append(pool.apply_async(
+                    _process_chunk_direct,
+                    (batch_lines, max_len, fw_tmp, bw_tmp),
+                ))
 
             for fut in futures:
                 try:
@@ -288,7 +340,7 @@ def _generate_ngrams_parallel(
                 except Exception:
                     pool.terminate()
                     raise
-                pbar.update(1)
+                pbar.update(CHUNKS_PER_BATCH)
             pbar.close()
 
         for out_path, tmp_paths in [
@@ -326,9 +378,9 @@ def _process_chunk_direct(
                     bw.write("\n")
 
 
-def _read_chunks_by_lines(path: str, n: int):
+def _read_chunks_by_lines(path: str, n: int, encoding: str = "utf-8"):
     chunk: list[str] = []
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(path, "r", encoding=encoding, errors="replace") as f:
         for line in f:
             chunk.append(line)
             if len(chunk) >= n:
@@ -405,12 +457,113 @@ def _process_text_segment(text: str, max_len: int, fw_out, bw_out) -> None:
 
 # ---- Entropy helpers ----
 
+def _split_sorted_ngram_by_chars(
+    ngram_file: str,
+    output_dir: str,
+    chars_per_file: int = 10,
+) -> list[str]:
+    """Split sorted n-gram file at first-character boundaries.
+
+    The n-gram file is sorted lexically (by word). Splitting at a character
+    boundary is safe — all lines for a given first character stay together.
+    """
+    split_paths: list[str] = []
+    current_fh = None
+    chars_since_split = 0
+    prev_char = ""
+    chunk_idx = 0
+
+    with open(ngram_file, "r", encoding="utf-8",
+              buffering=16 * 1024 * 1024) as fin:
+        for line in fin:
+            if not line:
+                continue
+            first = line[0]
+            if first != prev_char:
+                prev_char = first
+                chars_since_split += 1
+                if current_fh is None or chars_since_split > chars_per_file:
+                    if current_fh:
+                        current_fh.close()
+                    path = os.path.join(output_dir, f"chunk_{chunk_idx:05d}.txt")
+                    split_paths.append(path)
+                    current_fh = open(path, "w", encoding="utf-8")
+                    chunk_idx += 1
+                    chars_since_split = 1
+            if current_fh:
+                current_fh.write(line)
+    if current_fh:
+        current_fh.close()
+    return split_paths
+
+
+def _process_entropy_split(
+    split_path: str,
+    min_freq: int,
+    direct: bool,
+) -> tuple[int, str]:
+    """Compute entropy for one split file. Returns (count, out_path)."""
+    out_path = split_path + ".out"
+    with open(split_path, "r", encoding="utf-8",
+              buffering=16 * 1024 * 1024) as fin:
+        gen = compute_entropy_from_sorted(fin, min_freq=min_freq) if direct \
+             else compute_entropy_from_sorted_left(fin, min_freq=min_freq)
+        count = write_entropy_to_file(gen, out_path)
+    return count, out_path
+
+
+def _write_entropy_from_ngram_parallel(
+    ngram_file: str,
+    output_file: str,
+    min_freq: int,
+    direct: bool,
+    workers: int,
+    chars_per_file: int = 10,
+) -> int:
+    """Split n-gram file by first-char groups, compute entropy in parallel."""
+    split_dir = tempfile.mkdtemp(prefix="dict_build_entropy_")
+    try:
+        print("    Splitting by first-char groups...", end="", flush=True)
+        split_paths = _split_sorted_ngram_by_chars(
+            ngram_file, split_dir, chars_per_file,
+        )
+        print(f" {len(split_paths)} chunks")
+
+        total = 0
+        with Pool(processes=workers) as pool:
+            desc = "    Entropy" if direct else "    Entropy(L)"
+            pbar = tqdm.tqdm(total=len(split_paths), desc=desc, unit="chunk")
+
+            futures = [
+                pool.apply_async(_process_entropy_split, (sp, min_freq, direct))
+                for sp in split_paths
+            ]
+
+            with open(output_file, "w", encoding="utf-8") as out:
+                for fut in futures:
+                    try:
+                        count, tmp_path = fut.get()
+                    except Exception:
+                        pool.terminate()
+                        raise
+                    total += count
+                    with open(tmp_path, "r", encoding="utf-8") as f:
+                        shutil.copyfileobj(f, out)
+                    os.remove(tmp_path)
+                    pbar.update(1)
+            pbar.close()
+        return total
+    finally:
+        shutil.rmtree(split_dir, ignore_errors=True)
+
+
 def _write_entropy_from_ngram(
     ngram_file: str,
     output_file: str,
     min_freq: int,
     direct: bool,
 ) -> int:
+    """Legacy single-threaded entropy computation (kept for small files)."""
     with open(ngram_file, "r", encoding="utf-8", buffering=16 * 1024 * 1024) as fin:
         gen = compute_entropy_from_sorted(fin, min_freq=min_freq) if direct \
              else compute_entropy_from_sorted_left(fin, min_freq=min_freq)
