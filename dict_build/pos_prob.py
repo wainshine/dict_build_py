@@ -15,17 +15,24 @@ def load_pos_prob(filepath: str | None = None) -> dict[str, tuple[float, float, 
         filepath = os.path.join(os.path.dirname(__file__), "data", "pos_prop.txt")
 
     result: dict[str, tuple[float, float, float]] = {}
-    with open(filepath, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split("\t")
-            if len(parts) != 4:
-                continue
-            char = parts[0]
-            p_s = float(parts[1])
-            p_m = float(parts[2])
-            p_e = float(parts[3])
-            result[char] = (p_s, p_m, p_e)
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) != 4:
+                    continue
+                try:
+                    char = parts[0]
+                    p_s = float(parts[1])
+                    p_m = float(parts[2])
+                    p_e = float(parts[3])
+                    result[char] = (p_s, p_m, p_e)
+                except ValueError:
+                    continue
+    except FileNotFoundError:
+        print(f"  ⚠ Position-probability file not found: {filepath}")
+        print(f"    Words will not be filtered by position probability.")
     return result

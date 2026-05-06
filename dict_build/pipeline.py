@@ -6,12 +6,14 @@ Handles:
 - Directories of text files -> recursive scan
 """
 
+import io
 import os
 import shutil
 import time
 import threading
 import subprocess
 import tempfile
+import zlib
 from datetime import date
 from multiprocessing import Pool
 
@@ -20,6 +22,7 @@ import tqdm
 from .config import (
     DEFAULT_MAX_LEN, DEFAULT_MEM_MB, WORKERS, MIN_FREQ,
     CHUNK_LINES, CHUNKS_PER_BATCH, OUTPUT_FILE_SUFFIX,
+    BUCKET_SORT_MIN_BYTES, BUCKET_TARGET_BYTES, MIN_SORT_MEM_MB,
 )
 from .preprocess import preprocess_line
 from .ngram import generate_ngrams, generate_reverse_ngrams
@@ -40,15 +43,237 @@ BYTE_BUF = 8 * 1024 * 1024
 
 
 def _detect_file_encoding(filepath: str) -> str:
-    """Detect the encoding of a text file, fallback to utf-8."""
+    """Detect the encoding of a text file.
+
+    Tries UTF-8 first (if clean, it's the real encoding). For ambiguous
+    files, compares the CJK character *ratio* (not absolute count) across
+    GB18030/GBK/BIG5. Falls back to charset_normalizer if inconclusive.
+    """
+    with open(filepath, "rb") as f:
+        sample = f.read(64 * 1024)
+
+    # Try UTF-8 first.
+    # If clean: definitely UTF-8.
+    # If dirty with U+FFFD but still has CJK chars: it's probably damaged
+    # UTF-8 (or double-encoded), not pure GBK. Using GBK on these produces
+    # artifact characters. Only fall to GBK when UTF-8 has essentially
+    # zero CJK.
+    try:
+        text = sample.decode("utf-8")
+        if "\ufffd" not in text:
+            return "utf-8"
+    except UnicodeDecodeError:
+        # UTF-8 strict decode failed. Check if errors=replace still
+        # recovers meaningful CJK — double-encoded GBK files masquerading
+        # as valid GBK will produce garbage when decoded as GBK, so
+        # preferring UTF-8+replace is the safer choice.
+        text = sample.decode("utf-8", errors="replace")
+        ch = sum(1 for c in text if 0x4E00 <= ord(c) <= 0x9FA5)
+        if ch > len(sample) * 0.005:
+            return "utf-8"
+
+    # UTF-8 gave no meaningful CJK — try GBK/GB18030/BIG5
+    candidates = ["gb18030", "gbk", "big5"]
+    best_enc = "utf-8"
+    best_ratio = 0.0
+    total = len(sample)
+
+    for enc in candidates:
+        try:
+            text = sample.decode(enc, errors="replace")
+            ch = sum(1 for c in text if 0x4E00 <= ord(c) <= 0x9FA5)
+            ratio = ch / total if total > 0 else 0
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_enc = enc
+        except (UnicodeDecodeError, LookupError):
+            continue
+
+    # If heuristic found a clear winner, use it
+    if best_ratio > 0.01:
+        return best_enc
+
+    # Still inconclusive — try charset_normalizer
     try:
         import charset_normalizer
-        result = charset_normalizer.from_path(filepath)
-        enc = result.best().encoding
-        return enc if enc else "utf-8"
+        result = charset_normalizer.from_path(
+            filepath,
+            preemptive_behaviour=False,
+        )
+        best = result.best()
+        if best and best.encoding:
+            return best.encoding
     except Exception:
-        return "utf-8"
+        pass
 
+    return best_enc
+
+
+# ---- Bucket-sort helpers ----
+
+def _hash_line(line_bytes: bytes) -> int:
+    """Stable hash of n-gram word (pre-tab) for bucket assignment."""
+    tab = line_bytes.find(b"\t")
+    key = line_bytes[:tab] if tab > 0 else line_bytes
+    return zlib.crc32(key) & 0x7FFFFFFF
+
+
+def _calc_bucket_params(
+    total_size: int,
+    workers: int,
+    mem_mb: int,
+) -> tuple[int, int, int]:
+    """Return (num_buckets, max_concurrent_sorts, sort_mem_mb_per)."""
+    max_concurrent = min(workers, max(1, mem_mb // MIN_SORT_MEM_MB))
+    sort_mem_per = max(MIN_SORT_MEM_MB, mem_mb // max_concurrent)
+    num = max(1, int(total_size / BUCKET_TARGET_BYTES) + 1)
+    return num, max_concurrent, sort_mem_per
+
+
+def _sort_bucket(path: str, sort_mem_mb: int) -> str:
+    """Sort a single bucket file, return path to sorted result."""
+    out = path + ".sorted"
+    env = {**os.environ, "LC_ALL": "C"}
+    result = subprocess.run(
+        ["sort", "-S", f"{sort_mem_mb}M", "--parallel=1",
+         "-o", out, path],
+        capture_output=True, text=True, env=env,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Bucket sort failed (rc={result.returncode}): {result.stderr.strip()}"
+        )
+    os.remove(path)
+    return out
+
+
+def _distribute_batches(
+    paths: list[str],
+    bucket_dir: str,
+    num_buckets: int,
+    buf_limit: int,
+    batch_size: int,
+) -> None:
+    """Process a list of temp files in batches into bucket files."""
+    for batch_start in range(0, len(paths), batch_size):
+        batch = paths[batch_start:batch_start + batch_size]
+        fw_bh = [open(os.path.join(bucket_dir, f"fw_b{i:04d}.txt"), "ab")
+                 for i in range(num_buckets)]
+        bw_bh = [open(os.path.join(bucket_dir, f"bw_b{i:04d}.txt"), "ab")
+                 for i in range(num_buckets)]
+        fw_bufs = [io.BytesIO() for _ in range(num_buckets)]
+        bw_bufs = [io.BytesIO() for _ in range(num_buckets)]
+
+        for tp in batch:
+            carry = b""
+            is_fw = os.path.basename(tp).startswith("fw_")
+            buckets = fw_bh if is_fw else bw_bh
+            bufs = fw_bufs if is_fw else bw_bufs
+
+            with open(tp, "rb") as src:
+                while True:
+                    chunk = src.read(8 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    chunk = carry + chunk
+                    carry = b""
+                    lines = chunk.split(b"\n")
+                    for i in range(len(lines) - 1):
+                        line = lines[i] + b"\n"
+                        if not line.strip(b"\r\n"):
+                            continue
+                        h = _hash_line(line) % num_buckets
+                        bufs[h].write(line)
+                        if bufs[h].tell() >= buf_limit:
+                            buckets[h].write(bufs[h].getvalue())
+                            bufs[h].seek(0)
+                            bufs[h].truncate()
+                    carry = lines[-1]
+                if carry and carry.strip(b"\r\n"):
+                    h = _hash_line(carry + b"\n") % num_buckets
+                    bufs[h].write(carry + b"\n")
+            os.remove(tp)
+
+        for side_bufs, side_bh in [(fw_bufs, fw_bh), (bw_bufs, bw_bh)]:
+            for i in range(num_buckets):
+                if side_bufs[i].tell() > 0:
+                    side_bh[i].write(side_bufs[i].getvalue())
+                side_bufs[i].close()
+            for bh in side_bh:
+                bh.close()
+
+
+def _distribute_and_sort_ngrams(
+    temp_dir: str,
+    fw_tmp_paths: list[str],
+    bw_tmp_paths: list[str],
+    num_buckets: int,
+    max_concurrent: int,
+    sort_mem_mb: int,
+    mem_mb: int,
+) -> tuple[list[str], list[str]]:
+    """Partition n-gram temp files into hash buckets, sort each bucket.
+
+    Processes temp files in batches (avoiding open-file thrash on 153+
+    file handles). fw and bw streams run in parallel via two threads.
+    Buffer size per bucket adapts to available memory.
+    """
+    bucket_dir = tempfile.mkdtemp(prefix="dict_build_buckets_",
+                                   dir=temp_dir)
+
+    # Adaptive per-bucket buffer: 1/4 of mem, split across buckets,
+    # floor 128MB, cap 256MB.
+    mem_bytes = mem_mb * 1024 * 1024
+    buf_limit = max(128 * 1024**2,
+                    min(256 * 1024**2,
+                        (mem_bytes // 4) // max(num_buckets, 1)))
+
+    BATCH_SIZE = 15
+
+    # Two processes (no GIL) process fw and bw simultaneously
+    from multiprocessing import Process
+    fw_proc = Process(target=_distribute_batches,
+                      args=(fw_tmp_paths, bucket_dir, num_buckets,
+                            buf_limit, BATCH_SIZE))
+    bw_proc = Process(target=_distribute_batches,
+                      args=(bw_tmp_paths, bucket_dir, num_buckets,
+                            buf_limit, BATCH_SIZE))
+    fw_proc.start()
+    bw_proc.start()
+    fw_proc.join()
+    bw_proc.join()
+
+    if fw_proc.exitcode != 0:
+        raise RuntimeError(f"Forward distribution failed (exit {fw_proc.exitcode})")
+    if bw_proc.exitcode != 0:
+        raise RuntimeError(f"Backward distribution failed (exit {bw_proc.exitcode})")
+
+    # Collect bucket file paths
+    fw_bucket_paths = [os.path.join(bucket_dir, f"fw_b{i:04d}.txt")
+                       for i in range(num_buckets)]
+    bw_bucket_paths = [os.path.join(bucket_dir, f"bw_b{i:04d}.txt")
+                       for i in range(num_buckets)]
+
+    # Sort each bucket (parallel)
+    fw_sorted: list[str] = []
+    bw_sorted: list[str] = []
+    all_buckets = fw_bucket_paths + bw_bucket_paths
+    is_fw = [True] * len(fw_bucket_paths) + [False] * len(bw_bucket_paths)
+
+    with Pool(processes=max_concurrent) as pool:
+        futs = [pool.apply_async(_sort_bucket, (bp, sort_mem_mb))
+                for bp in all_buckets]
+        for fut, fw_flag in zip(futs, is_fw):
+            sp = fut.get()
+            if fw_flag:
+                fw_sorted.append(sp)
+            else:
+                bw_sorted.append(sp)
+
+    return fw_sorted, bw_sorted
+
+
+# ---- File collection ----
 
 def _collect_files(path: str) -> list[str]:
     if os.path.isfile(path):
@@ -120,96 +345,147 @@ def run_pipeline(
         huge_files = [f for f in txt_files if _is_single_line_file(f)]
         normal_files = [f for f in txt_files if f not in huge_files]
 
+        fw_tmp_paths: list[str] = []
+        bw_tmp_paths: list[str] = []
+        ngram_tmp_dir: str | None = None
+
         if normal_files:
-            _generate_ngrams_parallel(
-                normal_files, ngram_fw_path, ngram_bw_path, max_len, workers
+            fw_tmp_paths, bw_tmp_paths, ngram_tmp_dir = _generate_ngrams_parallel(
+                normal_files, ngram_fw_path, ngram_bw_path, max_len, workers,
             )
         for hf in huge_files:
             print(f"  Single-line mode: {os.path.basename(hf)} "
                   f"({os.path.getsize(hf)/1e9:.1f} GB)")
             _generate_ngrams_single_line(
-                hf, ngram_fw_path, ngram_bw_path, max_len
+                hf, ngram_fw_path, ngram_bw_path, max_len,
             )
 
-        fw_size = os.path.getsize(ngram_fw_path)
-        bw_size = os.path.getsize(ngram_bw_path)
-        print(f"  Forward n-grams: {fw_size / 1e9:.2f} GB")
-        print(f"  Backward n-grams: {bw_size / 1e9:.2f} GB")
+        total_ngram = sum(os.path.getsize(tp)
+                          for tp in fw_tmp_paths + bw_tmp_paths)
+        if os.path.exists(ngram_fw_path):
+            total_ngram += os.path.getsize(ngram_fw_path)
+            total_ngram += os.path.getsize(ngram_bw_path)
+
+        fw_display = total_ngram / 2 / 1e9 if total_ngram > 0 else 0
+        print(f"  Forward n-grams: {fw_display:.2f} GB")
+        print(f"  Backward n-grams: {fw_display:.2f} GB")
 
         ngram_fw_sorted = os.path.join(temp_dir, "ngram_forward_sorted.txt")
         ngram_bw_sorted = os.path.join(temp_dir, "ngram_backward_sorted.txt")
-
-        print("Stage 3: Sorting n-grams (LC_ALL=C for speed)...")
-        sort_env = {**os.environ, "LC_ALL": "C"}
-        p1 = subprocess.Popen([
-            "sort", "-S", f"{mem_mb}M", f"--parallel={workers}",
-            "-o", ngram_fw_sorted, ngram_fw_path,
-        ], stderr=subprocess.PIPE, text=True, env=sort_env)
-        p2 = subprocess.Popen([
-            "sort", "-S", f"{mem_mb}M", f"--parallel={workers}",
-            "-o", ngram_bw_sorted, ngram_bw_path,
-        ], stderr=subprocess.PIPE, text=True, env=sort_env)
-
-        fw_in_size = os.path.getsize(ngram_fw_path)
-        bw_in_size = os.path.getsize(ngram_bw_path)
-        total_in = fw_in_size + bw_in_size
-
-        def _monitor():
-            while p1.poll() is None or p2.poll() is None:
-                fw_out = os.path.getsize(ngram_fw_sorted) if os.path.exists(ngram_fw_sorted) else 0
-                bw_out = os.path.getsize(ngram_bw_sorted) if os.path.exists(ngram_bw_sorted) else 0
-                pct = (fw_out + bw_out) / total_in * 100 if total_in > 0 else 0
-                elapsed = time.time() - _monitor.t0
-                print(f"\r  Sorting... {pct:.0f}% ({elapsed:.0f}s)", end="", flush=True)
-                time.sleep(3)
-            elapsed = time.time() - _monitor.t0
-            print(f"\r  Sorting... 100% ({elapsed:.0f}s)", flush=True)
-        _monitor.t0 = time.time()
-        t = threading.Thread(target=_monitor, daemon=True)
-        t.start()
-
-        _, stderr1 = p1.communicate()
-        _, stderr2 = p2.communicate()
-        t.join(timeout=1)
-        if p1.returncode != 0:
-            raise RuntimeError(f"Forward sort failed: {stderr1}")
-        if p2.returncode != 0:
-            raise RuntimeError(f"Backward sort failed: {stderr2}")
-        for fp in (ngram_fw_path, ngram_bw_path):
-            try: os.remove(fp)
-            except OSError: pass
-        print()
-        print("  Sorting complete")
 
         right_entropy_file = os.path.join(temp_dir, "right_entropy.txt")
         left_entropy_unsorted = os.path.join(temp_dir, "left_entropy_unsorted.txt")
         left_entropy_file = os.path.join(temp_dir, "left_entropy.txt")
 
-        PARALLEL_ENTROPY_THRESHOLD = 1024 * 1024 * 1024  # 1GB
+        use_buckets = (total_ngram >= BUCKET_SORT_MIN_BYTES
+                       and not huge_files
+                       and fw_tmp_paths)
 
-        print(f"Stage 4a: Computing right entropy (min_freq={min_freq})...")
-        if os.path.getsize(ngram_fw_sorted) > PARALLEL_ENTROPY_THRESHOLD:
-            count = _write_entropy_from_ngram_parallel(
-                ngram_fw_sorted, right_entropy_file, min_freq,
-                direct=True, workers=workers,
+        if use_buckets:
+            num_buckets, max_conc, sort_mem = _calc_bucket_params(
+                total_ngram, workers, mem_mb,
             )
-        else:
-            count = _write_entropy_from_ngram(
-                ngram_fw_sorted, right_entropy_file, min_freq, direct=True,
-            )
-        print(f"  Right: {count} unique words")
+            print(f"Stage 3: Bucket-sorting n-grams"
+                  f" ({num_buckets} buckets, {max_conc} concurrent)...")
 
-        print(f"Stage 4b: Computing left entropy (min_freq={min_freq})...")
-        if os.path.getsize(ngram_bw_sorted) > PARALLEL_ENTROPY_THRESHOLD:
-            count = _write_entropy_from_ngram_parallel(
-                ngram_bw_sorted, left_entropy_unsorted, min_freq,
-                direct=False, workers=workers,
+            fw_sorted, bw_sorted = _distribute_and_sort_ngrams(
+                temp_dir, fw_tmp_paths, bw_tmp_paths,
+                num_buckets, max_conc, sort_mem, mem_mb,
             )
+            if ngram_tmp_dir:
+                shutil.rmtree(ngram_tmp_dir, ignore_errors=True)
+
+            # Entropy on sorted buckets, then concat
+            print(f"Stage 4a: Computing right entropy (min_freq={min_freq})...")
+            r_count = _compute_entropy_from_sorted_list(
+                fw_sorted, right_entropy_file, min_freq, direct=True,
+                workers=workers,
+            )
+            print(f"  Right: {r_count} unique words")
+            # Buckets produce per-group-sorted entropy; re-sort for merge
+            sort_file_inplace(right_entropy_file)
+
+            print(f"Stage 4b: Computing left entropy (min_freq={min_freq})...")
+            l_count = _compute_entropy_from_sorted_list(
+                bw_sorted, left_entropy_unsorted, min_freq, direct=False,
+                workers=workers,
+            )
+            print(f"  Left: {l_count} unique words")
         else:
-            count = _write_entropy_from_ngram(
-                ngram_bw_sorted, left_entropy_unsorted, min_freq, direct=False,
-            )
-        print(f"  Left: {count} unique words")
+            # Old path: concat temp files → single sort → entropy
+            if fw_tmp_paths:
+                _concat_temp_files(fw_tmp_paths, ngram_fw_path)
+                _concat_temp_files(bw_tmp_paths, ngram_bw_path)
+            if ngram_tmp_dir:
+                shutil.rmtree(ngram_tmp_dir, ignore_errors=True)
+
+            print("Stage 3: Sorting n-grams (LC_ALL=C for speed)...")
+            sort_env = {**os.environ, "LC_ALL": "C"}
+            p1 = subprocess.Popen([
+                "sort", "-S", f"{mem_mb}M", f"--parallel={workers}",
+                "-o", ngram_fw_sorted, ngram_fw_path,
+            ], stderr=subprocess.PIPE, text=True, env=sort_env)
+            p2 = subprocess.Popen([
+                "sort", "-S", f"{mem_mb}M", f"--parallel={workers}",
+                "-o", ngram_bw_sorted, ngram_bw_path,
+            ], stderr=subprocess.PIPE, text=True, env=sort_env)
+
+            fw_in = os.path.getsize(ngram_fw_path)
+            bw_in = os.path.getsize(ngram_bw_path)
+            total_in = fw_in + bw_in
+
+            def _monitor():
+                while p1.poll() is None or p2.poll() is None:
+                    fw_o = os.path.getsize(ngram_fw_sorted) if os.path.exists(ngram_fw_sorted) else 0
+                    bw_o = os.path.getsize(ngram_bw_sorted) if os.path.exists(ngram_bw_sorted) else 0
+                    pct = (fw_o + bw_o) / total_in * 100 if total_in > 0 else 0
+                    e = time.time() - _monitor.t0
+                    print(f"\r  Sorting... {pct:.0f}% ({e:.0f}s)", end="", flush=True)
+                    time.sleep(3)
+                e = time.time() - _monitor.t0
+                print(f"\r  Sorting... 100% ({e:.0f}s)", flush=True)
+            _monitor.t0 = time.time()
+            t = threading.Thread(target=_monitor, daemon=True)
+            t.start()
+
+            _, stderr1 = p1.communicate()
+            _, stderr2 = p2.communicate()
+            t.join(timeout=1)
+            if p1.returncode != 0:
+                raise RuntimeError(f"Forward sort failed: {stderr1}")
+            if p2.returncode != 0:
+                raise RuntimeError(f"Backward sort failed: {stderr2}")
+            for fp in (ngram_fw_path, ngram_bw_path):
+                try: os.remove(fp)
+                except OSError: pass
+            print()
+            print("  Sorting complete")
+
+            PARALLEL_ENTROPY_THRESHOLD = 1024 * 1024 * 1024
+
+            print(f"Stage 4a: Computing right entropy (min_freq={min_freq})...")
+            if os.path.getsize(ngram_fw_sorted) > PARALLEL_ENTROPY_THRESHOLD:
+                count = _write_entropy_from_ngram_parallel(
+                    ngram_fw_sorted, right_entropy_file, min_freq,
+                    direct=True, workers=workers,
+                )
+            else:
+                count = _write_entropy_from_ngram(
+                    ngram_fw_sorted, right_entropy_file, min_freq, direct=True,
+                )
+            print(f"  Right: {count} unique words")
+
+            print(f"Stage 4b: Computing left entropy (min_freq={min_freq})...")
+            if os.path.getsize(ngram_bw_sorted) > PARALLEL_ENTROPY_THRESHOLD:
+                count = _write_entropy_from_ngram_parallel(
+                    ngram_bw_sorted, left_entropy_unsorted, min_freq,
+                    direct=False, workers=workers,
+                )
+            else:
+                count = _write_entropy_from_ngram(
+                    ngram_bw_sorted, left_entropy_unsorted, min_freq, direct=False,
+                )
+            print(f"  Left: {count} unique words")
 
         print("Stage 4c: Sorting left entropy file...")
         sort_file_inplace(left_entropy_unsorted)
@@ -271,88 +547,81 @@ def _generate_ngrams_parallel(
     ngram_bw_path: str,
     max_len: int,
     workers: int,
-) -> None:
+) -> tuple[list[str], list[str], str]:
     """Generate n-grams with multiprocessing, writing directly to temp files.
 
-    Each worker writes its chunk output to a unique temp file pair.
-    Results are never pickled back; the main process only concatenates.
+    Returns (fw_tmp_paths, bw_tmp_paths, tmp_dir). Caller must process
+    the temp files and then delete tmp_dir.
     """
     ngram_tmp_dir = tempfile.mkdtemp(prefix="dict_build_ngrams_")
 
+    # Estimate total chunks from file sizes (avoid reading every file twice)
     total_chunks = 0
     file_encodings: dict[str, str] = {}
     for fp in txt_files:
         enc = _detect_file_encoding(fp)
         file_encodings[fp] = enc
-        with open(fp, "r", encoding=enc, errors="replace") as fh:
-            lc = sum(1 for _ in fh)
-        total_chunks += (lc + CHUNK_LINES - 1) // CHUNK_LINES if lc > 0 else 1
+        est_lines = max(1, os.path.getsize(fp) // 100)
+        total_chunks += (est_lines + CHUNK_LINES - 1) // CHUNK_LINES
 
     max_pending = workers * 4
     fw_tmp_paths: list[str] = []
     bw_tmp_paths: list[str] = []
 
-    try:
-        with Pool(processes=workers) as pool:
-            pbar = tqdm.tqdm(total=total_chunks, desc="  N-grams", unit="chunk")
-            futures: list = []
-            batch_id = 0
-            batch_lines: list[str] = []
-            batch_chunks: int = 0
+    with Pool(processes=workers) as pool:
+        pbar = tqdm.tqdm(total=total_chunks, desc="  N-grams", unit="chunk")
+        futures: list = []
+        chunks_per_task: list[int] = []
+        batch_id = 0
+        batch_lines: list[str] = []
+        batch_chunks: int = 0
 
-            for txt_file in txt_files:
-                enc = file_encodings[txt_file]
-                for chunk in _read_chunks_by_lines(txt_file, CHUNK_LINES, encoding=enc):
-                    batch_lines.extend(chunk)
-                    batch_chunks += 1
+        for txt_file in txt_files:
+            enc = file_encodings[txt_file]
+            for chunk in _read_chunks_by_lines(txt_file, CHUNK_LINES, encoding=enc):
+                batch_lines.extend(chunk)
+                batch_chunks += 1
 
-                    if batch_chunks >= CHUNKS_PER_BATCH:
-                        fw_tmp = os.path.join(ngram_tmp_dir, f"fw_{batch_id:06d}.txt")
-                        bw_tmp = os.path.join(ngram_tmp_dir, f"bw_{batch_id:06d}.txt")
-                        fw_tmp_paths.append(fw_tmp)
-                        bw_tmp_paths.append(bw_tmp)
+                if batch_chunks >= CHUNKS_PER_BATCH:
+                    fw_tmp = os.path.join(ngram_tmp_dir, f"fw_{batch_id:06d}.txt")
+                    bw_tmp = os.path.join(ngram_tmp_dir, f"bw_{batch_id:06d}.txt")
+                    fw_tmp_paths.append(fw_tmp)
+                    bw_tmp_paths.append(bw_tmp)
 
-                        if len(futures) >= max_pending:
-                            futures.pop(0).get()
-                            pbar.update(batch_chunks)
+                    if len(futures) >= max_pending:
+                        futures.pop(0).get()
+                        pbar.update(chunks_per_task.pop(0))
 
-                        futures.append(pool.apply_async(
-                            _process_chunk_direct,
-                            (batch_lines, max_len, fw_tmp, bw_tmp),
-                        ))
-                        batch_id += 1
-                        batch_lines = []
-                        batch_chunks = 0
+                    futures.append(pool.apply_async(
+                        _process_chunk_direct,
+                        (batch_lines, max_len, fw_tmp, bw_tmp),
+                    ))
+                    chunks_per_task.append(batch_chunks)
+                    batch_id += 1
+                    batch_lines = []
+                    batch_chunks = 0
 
-            if batch_lines:
-                fw_tmp = os.path.join(ngram_tmp_dir, f"fw_{batch_id:06d}.txt")
-                bw_tmp = os.path.join(ngram_tmp_dir, f"bw_{batch_id:06d}.txt")
-                fw_tmp_paths.append(fw_tmp)
-                bw_tmp_paths.append(bw_tmp)
-                futures.append(pool.apply_async(
-                    _process_chunk_direct,
-                    (batch_lines, max_len, fw_tmp, bw_tmp),
-                ))
+        if batch_lines:
+            fw_tmp = os.path.join(ngram_tmp_dir, f"fw_{batch_id:06d}.txt")
+            bw_tmp = os.path.join(ngram_tmp_dir, f"bw_{batch_id:06d}.txt")
+            fw_tmp_paths.append(fw_tmp)
+            bw_tmp_paths.append(bw_tmp)
+            futures.append(pool.apply_async(
+                _process_chunk_direct,
+                (batch_lines, max_len, fw_tmp, bw_tmp),
+            ))
+            chunks_per_task.append(batch_chunks)
 
-            for fut in futures:
-                try:
-                    fut.get()
-                except Exception:
-                    pool.terminate()
-                    raise
-                pbar.update(CHUNKS_PER_BATCH)
-            pbar.close()
+        for fut, n_chunks in zip(futures, chunks_per_task):
+            try:
+                fut.get()
+            except Exception:
+                pool.terminate()
+                raise
+            pbar.update(n_chunks)
+        pbar.close()
 
-        for out_path, tmp_paths in [
-            (ngram_fw_path, fw_tmp_paths),
-            (ngram_bw_path, bw_tmp_paths),
-        ]:
-            with open(out_path, "wb") as out:
-                for tp in tmp_paths:
-                    with open(tp, "rb") as f:
-                        shutil.copyfileobj(f, out)
-    finally:
-        shutil.rmtree(ngram_tmp_dir, ignore_errors=True)
+    return fw_tmp_paths, bw_tmp_paths, ngram_tmp_dir
 
 
 def _process_chunk_direct(
@@ -398,6 +667,7 @@ def _generate_ngrams_single_line(
     ngram_bw_path: str,
     max_len: int,
 ) -> None:
+    encoding = _detect_file_encoding(filepath)
     fw_out = open(ngram_fw_path, "a", encoding="utf-8")
     bw_out = open(ngram_bw_path, "a", encoding="utf-8")
     try:
@@ -412,25 +682,25 @@ def _generate_ngrams_single_line(
                 if not data:
                     if carryover:
                         _process_text_segment(
-                            carryover.decode("utf-8", errors="replace"),
+                            carryover.decode(encoding, errors="replace"),
                             max_len, fw_out, bw_out
                         )
                     break
 
                 segment = carryover + data
                 try:
-                    text = segment.decode("utf-8")
+                    text = segment.decode(encoding)
                     carryover = b""
                 except UnicodeDecodeError:
                     for cut in range(-1, -5, -1):
                         try:
-                            text = segment[:cut].decode("utf-8")
+                            text = segment[:cut].decode(encoding)
                             carryover = segment[cut:]
                             break
                         except UnicodeDecodeError:
                             continue
                     else:
-                        text = segment.decode("utf-8", errors="replace")
+                        text = segment.decode(encoding, errors="replace")
                         carryover = b""
 
                 for i in range(0, len(text), SINGLE_LINE_CHAR_CHUNK):
@@ -569,6 +839,47 @@ def _write_entropy_from_ngram(
              else compute_entropy_from_sorted_left(fin, min_freq=min_freq)
         pbar = tqdm.tqdm(gen, desc="    Entropy", unit="words", unit_scale=True)
         return write_entropy_to_file(pbar, output_file)
+
+
+def _concat_temp_files(paths: list[str], output_path: str) -> None:
+    """Concatenate multiple files into one output."""
+    with open(output_path, "wb") as out:
+        for tp in paths:
+            with open(tp, "rb") as f:
+                shutil.copyfileobj(f, out)
+            os.remove(tp)
+
+
+def _compute_entropy_from_sorted_list(
+    sorted_paths: list[str],
+    output_file: str,
+    min_freq: int,
+    direct: bool,
+    workers: int,
+) -> int:
+    """Compute entropy on each sorted bucket, concat results, return total."""
+    total = 0
+    with Pool(processes=min(workers, len(sorted_paths))) as pool:
+        desc = "    Entropy" if direct else "    Entropy(L)"
+        pbar = tqdm.tqdm(total=len(sorted_paths), desc=desc, unit="file")
+        futs = [
+            pool.apply_async(_process_entropy_split, (sp, min_freq, direct))
+            for sp in sorted_paths
+        ]
+        with open(output_file, "w", encoding="utf-8") as out:
+            for fut in futs:
+                try:
+                    count, tmp_path = fut.get()
+                except Exception:
+                    pool.terminate()
+                    raise
+                total += count
+                with open(tmp_path, "r", encoding="utf-8") as f:
+                    shutil.copyfileobj(f, out)
+                os.remove(tmp_path)
+                pbar.update(1)
+        pbar.close()
+    return total
 
 
 # ---- Output ----

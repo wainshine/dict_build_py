@@ -11,6 +11,7 @@ import tqdm
 
 from .preprocess import is_chinese
 from .entropy import read_entropy_from_file
+from .config import WORD_BLOCKLIST_SUBSTRINGS
 
 
 def build_and_mmap_trie(
@@ -117,6 +118,9 @@ def extract_words(
             pp = min(p_first_s, p_last_e)
 
         if pp < pos_threshold:
+            continue
+
+        if any(p in word for p in WORD_BLOCKLIST_SUBSTRINGS):
             continue
 
         results.append((word, freq, pmi, entropy, pp))
