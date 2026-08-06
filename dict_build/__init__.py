@@ -1,4 +1,11 @@
 """dict_build - Statistical Chinese new word discovery from raw text."""
 
-__version__ = "1.2.0"
+try:
+    from importlib.metadata import version
+
+    __version__ = version("dict-build")
+except Exception:
+    # Package not installed (running from source tree)
+    __version__ = "1.3.0"
+
 __author__ = "wainshine"

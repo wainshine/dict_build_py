@@ -2,11 +2,15 @@
 
 For single words out of context, uses dictionary lookup.
 Unknown words are marked as 'x'.
+
+jieba is imported lazily on first use: spawned multiprocessing workers
+never pay the import cost, and jieba's "Building prefix dict" log noise
+is silenced.
 """
 
 from __future__ import annotations
 
-import jieba.posseg as pseg
+import logging
 
 
 # Cache the POS dictionary (lazy loaded)
@@ -18,10 +22,11 @@ def _get_pos_dict() -> dict[str, str]:
     global _pos_dict
     if _pos_dict is not None:
         return _pos_dict
-    _pos_dict = {}
+    import jieba
+    jieba.setLogLevel(logging.WARNING)
+    import jieba.posseg as pseg
     # jieba.posseg.dt is a Trie that maps word -> (freq, tag)
-    for word, tag in pseg.dt.word_tag_tab.items():
-        _pos_dict[word] = tag
+    _pos_dict = dict(pseg.dt.word_tag_tab)
     return _pos_dict
 
 

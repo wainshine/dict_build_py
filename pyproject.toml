@@ -1,15 +1,27 @@
 [build-system]
-requires = ["setuptools>=75.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "dict-build"
-version = "1.2.0"
+version = "1.3.0"
 description = "Statistical Chinese new word discovery from raw text"
 authors = [{ name = "wainshine" }]
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 readme = "README.md"
 requires-python = ">=3.10"
+keywords = ["chinese", "nlp", "new-word-discovery", "dictionary", "ngram"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Natural Language :: Chinese (Simplified)",
+    "Natural Language :: Chinese (Traditional)",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Text Processing :: Linguistic",
+]
 dependencies = [
     "marisa-trie>=1.0",
     "tqdm>=4.0",

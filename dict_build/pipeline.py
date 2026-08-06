@@ -7,10 +7,11 @@ Handles:
 """
 
 import io
+import json
+import logging
 import os
 import shutil
 import time
-import threading
 import subprocess
 import tempfile
 import zlib
@@ -21,8 +22,16 @@ import tqdm
 
 from .config import (
     DEFAULT_MAX_LEN, DEFAULT_MEM_MB, WORKERS, MIN_FREQ,
+    PMI_THRESHOLD, ENTROPY_THRESHOLD, POS_PROB_THRESHOLD,
     CHUNK_LINES, CHUNKS_PER_BATCH, OUTPUT_FILE_SUFFIX,
     BUCKET_SORT_MIN_BYTES, BUCKET_TARGET_BYTES, MIN_SORT_MEM_MB,
+    MAX_BUCKETS, INTERMEDIATE_SIZE_FACTOR,
+    PENDING_TASK_FACTOR, NGRAM_WRITE_BATCH, AVG_LINE_BYTES,
+    BUCKET_DISTRIBUTE_BATCH, BUCKET_BUF_MIN_BYTES, BUCKET_BUF_MAX_BYTES,
+    PARALLEL_ENTROPY_MIN_BYTES, ENTROPY_SPLIT_CHARS_PER_FILE,
+    SINGLE_LINE_MIN_BYTES, SINGLE_LINE_MAX_NEWLINES,
+    SINGLE_LINE_SAMPLE_BYTES,
+    ENCODING_SAMPLE_BYTES, CJK_RATIO_UTF8_MIN, CJK_RATIO_WINNER_MIN,
 )
 from .preprocess import preprocess_line
 from .ngram import generate_ngrams, generate_reverse_ngrams
@@ -32,25 +41,95 @@ from .entropy import (
     write_entropy_to_file,
     sort_file_inplace,
     merge_entropy_files_sorted,
+    read_entropy_from_file,
 )
 from .pmi import build_and_mmap_trie, extract_words
-from .pos_tag import tag_word
 from .pos_prob import load_pos_prob
+
+logger = logging.getLogger(__name__)
 
 TEXT_EXTENSIONS = {".txt", ".csv", ".json", ".sql", ".md", ".html", ".htm"}
 SINGLE_LINE_CHAR_CHUNK = 200_000
 BYTE_BUF = 8 * 1024 * 1024
 
+# Probed lazily: (sort_executable, supports_gnu_flags)
+_SORT_CAPS: tuple[str, bool] | None = None
+
+
+def _sort_command(mem_mb: int, workers: int) -> list[str]:
+    """Build a system sort command, probing capabilities once per process.
+
+    GNU sort gets -S/--parallel; BSD sort gets plain flags (it accepts
+    but ignores -S on some versions, and silently ignores invalid
+    memsize units, so flags are only passed when the probe succeeds).
+    Raises RuntimeError when no sort executable is available.
+    """
+    global _SORT_CAPS
+    if _SORT_CAPS is None:
+        exe = shutil.which("sort")
+        if exe is None:
+            raise RuntimeError(
+                "System 'sort' command not found. Install GNU coreutils "
+                "(or run on Linux/macOS) to process large files."
+            )
+        gnu = False
+        try:
+            r = subprocess.run(
+                [exe, "-S", "1M", "--parallel=2"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=10,
+            )
+            gnu = r.returncode == 0
+        except Exception:
+            gnu = False
+        _SORT_CAPS = (exe, gnu)
+
+    exe, gnu = _SORT_CAPS
+    cmd = [exe]
+    if gnu:
+        cmd += ["-S", f"{max(1, mem_mb)}M", f"--parallel={max(1, workers)}"]
+    return cmd
+
+
+def _read_samples(filepath: str, sample_size: int = ENCODING_SAMPLE_BYTES) -> list[bytes]:
+    """Read head/middle/tail samples of a file for encoding detection."""
+    size = os.path.getsize(filepath)
+    if size <= sample_size:
+        with open(filepath, "rb") as f:
+            return [f.read()]
+    offsets = [0, max(0, size // 2 - sample_size // 2), size - sample_size]
+    samples = []
+    with open(filepath, "rb") as f:
+        for off in offsets:
+            f.seek(off)
+            samples.append(f.read(sample_size))
+    return samples
+
+
+def _decode_utf8_tolerant(sample: bytes) -> str:
+    """Strict UTF-8 decode, tolerating a character split at the sample edge.
+
+    Raises UnicodeDecodeError if the failure is not at the trailing edge.
+    """
+    for trim in range(0, 4):
+        try:
+            return sample[:len(sample) - trim].decode("utf-8") if trim else sample.decode("utf-8")
+        except UnicodeDecodeError as e:
+            if e.start < len(sample) - trim - 4:
+                raise
+    raise UnicodeDecodeError("utf-8", sample, 0, 1, "undecodable")
+
 
 def _detect_file_encoding(filepath: str) -> str:
     """Detect the encoding of a text file.
 
+    Samples head/middle/tail so an ASCII header does not mask a GBK body.
     Tries UTF-8 first (if clean, it's the real encoding). For ambiguous
     files, compares the CJK character *ratio* (not absolute count) across
     GB18030/GBK/BIG5. Falls back to charset_normalizer if inconclusive.
     """
-    with open(filepath, "rb") as f:
-        sample = f.read(64 * 1024)
+    samples = _read_samples(filepath)
+    total = sum(len(s) for s in samples)
 
     # Try UTF-8 first.
     # If clean: definitely UTF-8.
@@ -59,28 +138,27 @@ def _detect_file_encoding(filepath: str) -> str:
     # artifact characters. Only fall to GBK when UTF-8 has essentially
     # zero CJK.
     try:
-        text = sample.decode("utf-8")
-        if "\ufffd" not in text:
+        text = "".join(_decode_utf8_tolerant(s) for s in samples)
+        if "�" not in text:
             return "utf-8"
     except UnicodeDecodeError:
         # UTF-8 strict decode failed. Check if errors=replace still
         # recovers meaningful CJK — double-encoded GBK files masquerading
         # as valid GBK will produce garbage when decoded as GBK, so
         # preferring UTF-8+replace is the safer choice.
-        text = sample.decode("utf-8", errors="replace")
+        text = "".join(s.decode("utf-8", errors="replace") for s in samples)
         ch = sum(1 for c in text if 0x4E00 <= ord(c) <= 0x9FA5)
-        if ch > len(sample) * 0.005:
+        if ch > total * CJK_RATIO_UTF8_MIN:
             return "utf-8"
 
     # UTF-8 gave no meaningful CJK — try GBK/GB18030/BIG5
     candidates = ["gb18030", "gbk", "big5"]
     best_enc = "utf-8"
     best_ratio = 0.0
-    total = len(sample)
 
     for enc in candidates:
         try:
-            text = sample.decode(enc, errors="replace")
+            text = "".join(s.decode(enc, errors="replace") for s in samples)
             ch = sum(1 for c in text if 0x4E00 <= ord(c) <= 0x9FA5)
             ratio = ch / total if total > 0 else 0
             if ratio > best_ratio:
@@ -90,8 +168,23 @@ def _detect_file_encoding(filepath: str) -> str:
             continue
 
     # If heuristic found a clear winner, use it
-    if best_ratio > 0.01:
+    if best_ratio > CJK_RATIO_WINNER_MIN:
         return best_enc
+
+    # Still inconclusive — try charset_normalizer
+    try:
+        import charset_normalizer
+        result = charset_normalizer.from_path(
+            filepath,
+            preemptive_behaviour=False,
+        )
+        best = result.best()
+        if best and best.encoding:
+            return best.encoding
+    except Exception:
+        pass
+
+    return best_enc
 
     # Still inconclusive — try charset_normalizer
     try:
@@ -127,6 +220,7 @@ def _calc_bucket_params(
     max_concurrent = min(workers, max(1, mem_mb // MIN_SORT_MEM_MB))
     sort_mem_per = max(MIN_SORT_MEM_MB, mem_mb // max_concurrent)
     num = max(1, int(total_size / BUCKET_TARGET_BYTES) + 1)
+    num = min(num, MAX_BUCKETS)
     return num, max_concurrent, sort_mem_per
 
 
@@ -135,8 +229,7 @@ def _sort_bucket(path: str, sort_mem_mb: int) -> str:
     out = path + ".sorted"
     env = {**os.environ, "LC_ALL": "C"}
     result = subprocess.run(
-        ["sort", "-S", f"{sort_mem_mb}M", "--parallel=1",
-         "-o", out, path],
+        [*_sort_command(sort_mem_mb, 1), "-o", out, path],
         capture_output=True, text=True, env=env,
     )
     if result.returncode != 0:
@@ -172,26 +265,28 @@ def _distribute_batches(
 
             with open(tp, "rb") as src:
                 while True:
-                    chunk = src.read(8 * 1024 * 1024)
+                    chunk = src.read(BYTE_BUF)
                     if not chunk:
                         break
                     chunk = carry + chunk
                     carry = b""
                     lines = chunk.split(b"\n")
                     for i in range(len(lines) - 1):
-                        line = lines[i] + b"\n"
-                        if not line.strip(b"\r\n"):
+                        line = lines[i]
+                        if not line or line == b"\r":
                             continue
                         h = _hash_line(line) % num_buckets
                         bufs[h].write(line)
+                        bufs[h].write(b"\n")
                         if bufs[h].tell() >= buf_limit:
                             buckets[h].write(bufs[h].getvalue())
                             bufs[h].seek(0)
                             bufs[h].truncate()
                     carry = lines[-1]
-                if carry and carry.strip(b"\r\n"):
-                    h = _hash_line(carry + b"\n") % num_buckets
-                    bufs[h].write(carry + b"\n")
+                if carry and carry != b"\r":
+                    h = _hash_line(carry) % num_buckets
+                    bufs[h].write(carry)
+                    bufs[h].write(b"\n")
             os.remove(tp)
 
         for side_bufs, side_bh in [(fw_bufs, fw_bh), (bw_bufs, bw_bh)]:
@@ -215,29 +310,27 @@ def _distribute_and_sort_ngrams(
     """Partition n-gram temp files into hash buckets, sort each bucket.
 
     Processes temp files in batches (avoiding open-file thrash on 153+
-    file handles). fw and bw streams run in parallel via two threads.
+    file handles). fw and bw streams run in parallel via two processes.
     Buffer size per bucket adapts to available memory.
     """
     bucket_dir = tempfile.mkdtemp(prefix="dict_build_buckets_",
                                    dir=temp_dir)
 
     # Adaptive per-bucket buffer: 1/4 of mem, split across buckets,
-    # floor 128MB, cap 256MB.
+    # floor/cap from config.
     mem_bytes = mem_mb * 1024 * 1024
-    buf_limit = max(128 * 1024**2,
-                    min(256 * 1024**2,
+    buf_limit = max(BUCKET_BUF_MIN_BYTES,
+                    min(BUCKET_BUF_MAX_BYTES,
                         (mem_bytes // 4) // max(num_buckets, 1)))
-
-    BATCH_SIZE = 15
 
     # Two processes (no GIL) process fw and bw simultaneously
     from multiprocessing import Process
     fw_proc = Process(target=_distribute_batches,
                       args=(fw_tmp_paths, bucket_dir, num_buckets,
-                            buf_limit, BATCH_SIZE))
+                            buf_limit, BUCKET_DISTRIBUTE_BATCH))
     bw_proc = Process(target=_distribute_batches,
                       args=(bw_tmp_paths, bucket_dir, num_buckets,
-                            buf_limit, BATCH_SIZE))
+                            buf_limit, BUCKET_DISTRIBUTE_BATCH))
     fw_proc.start()
     bw_proc.start()
     fw_proc.join()
@@ -301,19 +394,130 @@ def _make_output_path(input_path: str) -> str:
 
 
 def _is_single_line_file(filepath: str) -> bool:
+    """Heuristic: >100MB and <=10 newlines in head/mid/tail samples.
+
+    Samples 4MB at the head, middle and tail instead of scanning the
+    whole file, so a 5GB single-line file is not read twice.
+    """
     size = os.path.getsize(filepath)
-    if size < 100 * 1024 * 1024:
+    if size < SINGLE_LINE_MIN_BYTES:
         return False
+    chunk = SINGLE_LINE_SAMPLE_BYTES
+    offsets = [0, max(0, size // 2 - chunk // 2), max(0, size - chunk)]
+    count = 0
     with open(filepath, "rb") as f:
-        count = 0
-        while True:
-            data = f.read(4 * 1024 * 1024)
-            if not data:
-                break
-            count += data.count(b"\n")
-            if count > 10:
+        for off in offsets:
+            f.seek(off)
+            count += f.read(chunk).count(b"\n")
+            if count > SINGLE_LINE_MAX_NEWLINES:
                 return False
-    return count <= 10
+    return True
+
+
+# ---- Checkpoint helpers (resume via --work-dir) ----
+
+_CHECKPOINT_STAGES = ("ngrams", "ngrams_finalized", "sorted", "entropy", "merged")
+_META_FILE = "run_meta.json"
+_NGRAM_MANIFEST = "ngram_manifest.txt"
+_BUCKETS_MANIFEST = "buckets_manifest.txt"
+_MERGED_FILE = "merged.tsv"
+
+
+def _ckpt_path(run_dir: str, stage: str) -> str:
+    return os.path.join(run_dir, f".{stage}.done")
+
+
+def _ckpt_done(run_dir: str, stage: str) -> bool:
+    return os.path.exists(_ckpt_path(run_dir, stage))
+
+
+def _ckpt_mark(run_dir: str, stage: str) -> None:
+    open(_ckpt_path(run_dir, stage), "w").close()
+
+
+def _ckpt_unmark(run_dir: str, stage: str) -> None:
+    try:
+        os.remove(_ckpt_path(run_dir, stage))
+    except OSError:
+        pass
+
+
+def _ckpt_clear(run_dir: str) -> None:
+    """Remove all checkpoint markers, manifests and known intermediates."""
+    names = [f".{s}.done" for s in _CHECKPOINT_STAGES]
+    names += [_META_FILE, _MERGED_FILE,
+              _NGRAM_MANIFEST + ".fw", _NGRAM_MANIFEST + ".bw",
+              _BUCKETS_MANIFEST + ".fw", _BUCKETS_MANIFEST + ".bw",
+              "ngram_forward.txt", "ngram_backward.txt",
+              "ngram_forward_sorted.txt", "ngram_backward_sorted.txt",
+              "right_entropy.txt", "left_entropy_unsorted.txt",
+              "left_entropy.txt", "freq.trie"]
+    for name in names:
+        try:
+            os.remove(os.path.join(run_dir, name))
+        except OSError:
+            pass
+    for entry in os.scandir(run_dir):
+        if entry.is_dir(follow_symlinks=False) and entry.name.startswith(
+                ("dict_build_ngrams_", "dict_build_buckets_")):
+            shutil.rmtree(entry.path, ignore_errors=True)
+
+
+def _ckpt_read_meta(run_dir: str) -> dict | None:
+    try:
+        with open(os.path.join(run_dir, _META_FILE)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _ckpt_write_meta(run_dir: str, meta: dict) -> None:
+    with open(os.path.join(run_dir, _META_FILE), "w") as f:
+        json.dump(meta, f)
+
+
+def _write_list_file(path: str, items: list[str]) -> None:
+    with open(path, "w") as f:
+        for item in items:
+            f.write(item + "\n")
+
+
+def _read_list_file(path: str) -> list[str] | None:
+    """Read a path list; None if the manifest or any listed file is missing."""
+    try:
+        with open(path) as f:
+            items = [line.strip() for line in f if line.strip()]
+    except OSError:
+        return None
+    if not items or not all(os.path.exists(p) for p in items):
+        return None
+    return items
+
+
+def _read_ngram_manifest(run_dir: str) -> tuple[list[str], list[str]] | None:
+    fw = _read_list_file(os.path.join(run_dir, _NGRAM_MANIFEST + ".fw"))
+    bw = _read_list_file(os.path.join(run_dir, _NGRAM_MANIFEST + ".bw"))
+    if fw is None or bw is None:
+        return None
+    return fw, bw
+
+
+def _write_ngram_manifest(run_dir: str, fw: list[str], bw: list[str]) -> None:
+    _write_list_file(os.path.join(run_dir, _NGRAM_MANIFEST + ".fw"), fw)
+    _write_list_file(os.path.join(run_dir, _NGRAM_MANIFEST + ".bw"), bw)
+
+
+def _read_buckets_manifest(run_dir: str) -> tuple[list[str], list[str]] | None:
+    fw = _read_list_file(os.path.join(run_dir, _BUCKETS_MANIFEST + ".fw"))
+    bw = _read_list_file(os.path.join(run_dir, _BUCKETS_MANIFEST + ".bw"))
+    if fw is None or bw is None:
+        return None
+    return fw, bw
+
+
+def _write_buckets_manifest(run_dir: str, fw: list[str], bw: list[str]) -> None:
+    _write_list_file(os.path.join(run_dir, _BUCKETS_MANIFEST + ".fw"), fw)
+    _write_list_file(os.path.join(run_dir, _BUCKETS_MANIFEST + ".bw"), bw)
 
 
 def run_pipeline(
@@ -324,219 +528,356 @@ def run_pipeline(
     workers: int = WORKERS,
     min_freq: int = MIN_FREQ,
     pos_prob_path: str | None = None,
+    temp_dir: str | None = None,
+    work_dir: str | None = None,
+    force: bool = False,
+    pmi_threshold: float = PMI_THRESHOLD,
+    entropy_threshold: float = ENTROPY_THRESHOLD,
+    pos_threshold: float = POS_PROB_THRESHOLD,
 ) -> str:
+    """Run the full word-extraction pipeline.
+
+    Args:
+        temp_dir: Parent directory for a temporary working directory
+            (removed when the run finishes, successfully or not).
+        work_dir: Persistent working directory enabling checkpointed
+            resume. Stage markers (.done files) let an interrupted run
+            restart from the last completed stage. Intermediate files
+            are kept on failure and cleaned on success.
+        force: Ignore existing checkpoints in work_dir and start over.
+        pmi_threshold: Minimum PMI for a candidate word.
+        entropy_threshold: Minimum min(left, right) entropy.
+        pos_threshold: Minimum position formation probability.
+
+    Note:
+        On platforms using the "spawn" multiprocessing start method
+        (macOS/Windows), callers must guard entry with
+        ``if __name__ == "__main__":``.
+    """
     txt_files = _collect_files(input_path)
     total_size = sum(os.path.getsize(fp) for fp in txt_files)
-    print(f"Found {len(txt_files)} text file(s) to process "
-          f"({total_size / 1e9:.1f} GB)")
+    logger.info("Found %d text file(s) to process (%.1f GB)",
+                len(txt_files), total_size / 1e9)
     if total_size > 2 * 1024 * 1024 * 1024:
-        print(f"  ⚠ Input > 2 GB, processing may take a long time."
-              f" Consider --min-freq higher or sample first.")
+        logger.warning("Input > 2 GB, processing may take a long time. "
+                       "Consider --min-freq higher or sample first.")
 
     if output_path is None:
         output_path = _make_output_path(input_path)
 
-    temp_dir = tempfile.mkdtemp(prefix="dict_build_")
-    ngram_fw_path = os.path.join(temp_dir, "ngram_forward.txt")
-    ngram_bw_path = os.path.join(temp_dir, "ngram_backward.txt")
+    checkpointing = work_dir is not None
+    if checkpointing:
+        os.makedirs(work_dir, exist_ok=True)
+        run_dir = work_dir
+        if force:
+            _ckpt_clear(run_dir)
+    else:
+        temp_parent = temp_dir if temp_dir is not None else tempfile.gettempdir()
+        run_dir = tempfile.mkdtemp(prefix="dict_build_", dir=temp_parent)
 
+    estimated_intermediate = total_size * INTERMEDIATE_SIZE_FACTOR
+    free_bytes = shutil.disk_usage(run_dir).free
+    if free_bytes < estimated_intermediate:
+        raise RuntimeError(
+            f"Insufficient disk space in {run_dir}: "
+            f"{free_bytes / 1e9:.1f} GB free, "
+            f"~{estimated_intermediate / 1e9:.1f} GB needed for intermediate "
+            f"data. Use --temp-dir/--work-dir to point at a larger disk, "
+            f"or raise --min-freq / sample the input first."
+        )
+
+    ngram_fw_path = os.path.join(run_dir, "ngram_forward.txt")
+    ngram_bw_path = os.path.join(run_dir, "ngram_backward.txt")
+    ngram_fw_sorted = os.path.join(run_dir, "ngram_forward_sorted.txt")
+    ngram_bw_sorted = os.path.join(run_dir, "ngram_backward_sorted.txt")
+    right_entropy_file = os.path.join(run_dir, "right_entropy.txt")
+    left_entropy_unsorted = os.path.join(run_dir, "left_entropy_unsorted.txt")
+    left_entropy_file = os.path.join(run_dir, "left_entropy.txt")
+    merged_file = os.path.join(run_dir, _MERGED_FILE)
+    trie_file = os.path.join(run_dir, "freq.trie")
+
+    signature = {
+        "input": os.path.abspath(input_path),
+        "files": sorted([os.path.abspath(f), os.path.getsize(f)]
+                        for f in txt_files),
+        "max_len": max_len,
+        "min_freq": min_freq,
+        "entropy_threshold": entropy_threshold,
+    }
+    if checkpointing:
+        old_meta = _ckpt_read_meta(run_dir)
+        if old_meta is not None and any(
+                old_meta.get(k) != v for k, v in signature.items()):
+            logger.warning("Input or parameters changed since the last run; "
+                           "discarding checkpoints and starting over.")
+            _ckpt_clear(run_dir)
+
+    # Stage indices: 0 ngrams, 1 route, 2 sort (non-bucket only),
+    # 3 entropy, 4 merge, 5 extract
+    stage = 0
+    use_buckets: bool | None = None
+    fw_tmp_paths: list[str] = []
+    bw_tmp_paths: list[str] = []
+    fw_sorted: list[str] = []
+    bw_sorted: list[str] = []
+    merged: list[tuple[str, int, float]] | None = None
+
+    if checkpointing:
+        meta = _ckpt_read_meta(run_dir) or {}
+        mb = meta.get("bucket_mode")
+        if _ckpt_done(run_dir, "merged") and os.path.exists(merged_file):
+            stage = 5
+        elif (_ckpt_done(run_dir, "entropy")
+              and os.path.exists(right_entropy_file)
+              and os.path.exists(left_entropy_file)):
+            stage = 4
+        elif _ckpt_done(run_dir, "sorted") and mb is not None and (
+                (mb and _read_buckets_manifest(run_dir) is not None)
+                or (not mb and os.path.exists(ngram_fw_sorted)
+                    and os.path.exists(ngram_bw_sorted))):
+            stage = 3
+            use_buckets = bool(mb)
+        elif (_ckpt_done(run_dir, "ngrams_finalized")
+              and os.path.exists(ngram_fw_path)
+              and os.path.exists(ngram_bw_path)):
+            stage = 2
+            use_buckets = False
+        elif (_ckpt_done(run_dir, "ngrams")
+              # parallel mode leaves a manifest; single-line-only runs
+              # leave data directly in the ngram files
+              and (_read_ngram_manifest(run_dir) is not None
+                   or os.path.exists(ngram_fw_path))):
+            stage = 1
+        if stage:
+            logger.info("Resuming from checkpoint (stage %d)", stage)
+
+    success = False
     try:
-        print(f"Stage 1-2: Preprocessing + N-gram generation (workers={workers})...")
-        huge_files = [f for f in txt_files if _is_single_line_file(f)]
-        normal_files = [f for f in txt_files if f not in huge_files]
+        if stage == 0:
+            logger.info("Stage 1-2: Preprocessing + N-gram generation "
+                        "(workers=%d)...", workers)
+            if checkpointing:
+                _ckpt_clear(run_dir)
+            huge_files = [f for f in txt_files if _is_single_line_file(f)]
+            normal_files = [f for f in txt_files if f not in huge_files]
 
-        fw_tmp_paths: list[str] = []
-        bw_tmp_paths: list[str] = []
-        ngram_tmp_dir: str | None = None
+            if normal_files:
+                fw_tmp_paths, bw_tmp_paths, _ = _generate_ngrams_parallel(
+                    normal_files, ngram_fw_path, ngram_bw_path,
+                    max_len, workers,
+                )
+            for hf in huge_files:
+                logger.info("  Single-line mode: %s (%.1f GB)",
+                            os.path.basename(hf),
+                            os.path.getsize(hf) / 1e9)
+                _generate_ngrams_single_line(
+                    hf, ngram_fw_path, ngram_bw_path, max_len,
+                )
+            if checkpointing:
+                _write_ngram_manifest(run_dir, fw_tmp_paths, bw_tmp_paths)
+                _ckpt_mark(run_dir, "ngrams")
+            stage = 1
 
-        if normal_files:
-            fw_tmp_paths, bw_tmp_paths, ngram_tmp_dir = _generate_ngrams_parallel(
-                normal_files, ngram_fw_path, ngram_bw_path, max_len, workers,
-            )
-        for hf in huge_files:
-            print(f"  Single-line mode: {os.path.basename(hf)} "
-                  f"({os.path.getsize(hf)/1e9:.1f} GB)")
-            _generate_ngrams_single_line(
-                hf, ngram_fw_path, ngram_bw_path, max_len,
-            )
+        if stage == 1:
+            if checkpointing and not fw_tmp_paths and not bw_tmp_paths:
+                restored = _read_ngram_manifest(run_dir)
+                if restored is not None:
+                    fw_tmp_paths, bw_tmp_paths = restored
 
-        total_ngram = sum(os.path.getsize(tp)
-                          for tp in fw_tmp_paths + bw_tmp_paths)
-        if os.path.exists(ngram_fw_path):
-            total_ngram += os.path.getsize(ngram_fw_path)
-            total_ngram += os.path.getsize(ngram_bw_path)
+            fw_size = sum(os.path.getsize(tp) for tp in fw_tmp_paths)
+            bw_size = sum(os.path.getsize(tp) for tp in bw_tmp_paths)
+            if os.path.exists(ngram_fw_path):
+                fw_size += os.path.getsize(ngram_fw_path)
+                bw_size += os.path.getsize(ngram_bw_path)
+            total_ngram = fw_size + bw_size
+            logger.info("  Forward n-grams: %.2f GB", fw_size / 1e9)
+            logger.info("  Backward n-grams: %.2f GB", bw_size / 1e9)
 
-        fw_display = total_ngram / 2 / 1e9 if total_ngram > 0 else 0
-        print(f"  Forward n-grams: {fw_display:.2f} GB")
-        print(f"  Backward n-grams: {fw_display:.2f} GB")
+            if total_ngram == 0:
+                logger.info("  No valid Chinese text found in input.")
+                _write_output([], output_path)
+                success = True
+                return output_path
 
-        ngram_fw_sorted = os.path.join(temp_dir, "ngram_forward_sorted.txt")
-        ngram_bw_sorted = os.path.join(temp_dir, "ngram_backward_sorted.txt")
+            huge_files = [f for f in txt_files if _is_single_line_file(f)]
+            use_buckets = bool(total_ngram >= BUCKET_SORT_MIN_BYTES
+                               and not huge_files
+                               and fw_tmp_paths)
+            if checkpointing:
+                _ckpt_write_meta(run_dir,
+                                 {**signature, "bucket_mode": use_buckets})
 
-        right_entropy_file = os.path.join(temp_dir, "right_entropy.txt")
-        left_entropy_unsorted = os.path.join(temp_dir, "left_entropy_unsorted.txt")
-        left_entropy_file = os.path.join(temp_dir, "left_entropy.txt")
+            if use_buckets:
+                num_buckets, max_conc, sort_mem = _calc_bucket_params(
+                    total_ngram, workers, mem_mb,
+                )
+                logger.info("Stage 3: Bucket-sorting n-grams "
+                            "(%d buckets, %d concurrent)...",
+                            num_buckets, max_conc)
+                # Distribution consumes the temp files: past this point
+                # the ngrams checkpoint is no longer recoverable.
+                _ckpt_unmark(run_dir, "ngrams")
+                fw_sorted, bw_sorted = _distribute_and_sort_ngrams(
+                    run_dir, fw_tmp_paths, bw_tmp_paths,
+                    num_buckets, max_conc, sort_mem, mem_mb,
+                )
+                if checkpointing:
+                    _write_buckets_manifest(run_dir, fw_sorted, bw_sorted)
+                    _ckpt_mark(run_dir, "sorted")
+                stage = 3
+            else:
+                # Old path: concat temp files → single sort → entropy
+                _ckpt_unmark(run_dir, "ngrams")
+                if fw_tmp_paths:
+                    _concat_temp_files(fw_tmp_paths, ngram_fw_path)
+                    _concat_temp_files(bw_tmp_paths, ngram_bw_path)
+                if checkpointing:
+                    _ckpt_mark(run_dir, "ngrams_finalized")
+                stage = 2
 
-        use_buckets = (total_ngram >= BUCKET_SORT_MIN_BYTES
-                       and not huge_files
-                       and fw_tmp_paths)
-
-        if use_buckets:
-            num_buckets, max_conc, sort_mem = _calc_bucket_params(
-                total_ngram, workers, mem_mb,
-            )
-            print(f"Stage 3: Bucket-sorting n-grams"
-                  f" ({num_buckets} buckets, {max_conc} concurrent)...")
-
-            fw_sorted, bw_sorted = _distribute_and_sort_ngrams(
-                temp_dir, fw_tmp_paths, bw_tmp_paths,
-                num_buckets, max_conc, sort_mem, mem_mb,
-            )
-            if ngram_tmp_dir:
-                shutil.rmtree(ngram_tmp_dir, ignore_errors=True)
-
-            # Entropy on sorted buckets, then concat
-            print(f"Stage 4a: Computing right entropy (min_freq={min_freq})...")
-            r_count = _compute_entropy_from_sorted_list(
-                fw_sorted, right_entropy_file, min_freq, direct=True,
-                workers=workers,
-            )
-            print(f"  Right: {r_count} unique words")
-            # Buckets produce per-group-sorted entropy; re-sort for merge
-            sort_file_inplace(right_entropy_file)
-
-            print(f"Stage 4b: Computing left entropy (min_freq={min_freq})...")
-            l_count = _compute_entropy_from_sorted_list(
-                bw_sorted, left_entropy_unsorted, min_freq, direct=False,
-                workers=workers,
-            )
-            print(f"  Left: {l_count} unique words")
-        else:
-            # Old path: concat temp files → single sort → entropy
-            if fw_tmp_paths:
-                _concat_temp_files(fw_tmp_paths, ngram_fw_path)
-                _concat_temp_files(bw_tmp_paths, ngram_bw_path)
-            if ngram_tmp_dir:
-                shutil.rmtree(ngram_tmp_dir, ignore_errors=True)
-
-            print("Stage 3: Sorting n-grams (LC_ALL=C for speed)...")
+        if stage == 2:
+            logger.info("Stage 3: Sorting n-grams (LC_ALL=C for speed)...")
             sort_env = {**os.environ, "LC_ALL": "C"}
+            sort_cmd = _sort_command(mem_mb, workers)
+            t0 = time.time()
             p1 = subprocess.Popen([
-                "sort", "-S", f"{mem_mb}M", f"--parallel={workers}",
-                "-o", ngram_fw_sorted, ngram_fw_path,
+                *sort_cmd, "-o", ngram_fw_sorted, ngram_fw_path,
             ], stderr=subprocess.PIPE, text=True, env=sort_env)
             p2 = subprocess.Popen([
-                "sort", "-S", f"{mem_mb}M", f"--parallel={workers}",
-                "-o", ngram_bw_sorted, ngram_bw_path,
+                *sort_cmd, "-o", ngram_bw_sorted, ngram_bw_path,
             ], stderr=subprocess.PIPE, text=True, env=sort_env)
-
-            fw_in = os.path.getsize(ngram_fw_path)
-            bw_in = os.path.getsize(ngram_bw_path)
-            total_in = fw_in + bw_in
-
-            def _monitor():
-                while p1.poll() is None or p2.poll() is None:
-                    fw_o = os.path.getsize(ngram_fw_sorted) if os.path.exists(ngram_fw_sorted) else 0
-                    bw_o = os.path.getsize(ngram_bw_sorted) if os.path.exists(ngram_bw_sorted) else 0
-                    pct = (fw_o + bw_o) / total_in * 100 if total_in > 0 else 0
-                    e = time.time() - _monitor.t0
-                    print(f"\r  Sorting... {pct:.0f}% ({e:.0f}s)", end="", flush=True)
-                    time.sleep(3)
-                e = time.time() - _monitor.t0
-                print(f"\r  Sorting... 100% ({e:.0f}s)", flush=True)
-            _monitor.t0 = time.time()
-            t = threading.Thread(target=_monitor, daemon=True)
-            t.start()
-
             _, stderr1 = p1.communicate()
             _, stderr2 = p2.communicate()
-            t.join(timeout=1)
             if p1.returncode != 0:
                 raise RuntimeError(f"Forward sort failed: {stderr1}")
             if p2.returncode != 0:
                 raise RuntimeError(f"Backward sort failed: {stderr2}")
             for fp in (ngram_fw_path, ngram_bw_path):
-                try: os.remove(fp)
-                except OSError: pass
-            print()
-            print("  Sorting complete")
+                try:
+                    os.remove(fp)
+                except OSError:
+                    pass
+            logger.info("  Sorting complete (%.0fs)", time.time() - t0)
+            if checkpointing:
+                _ckpt_mark(run_dir, "sorted")
+            stage = 3
 
-            PARALLEL_ENTROPY_THRESHOLD = 1024 * 1024 * 1024
+        if stage == 3:
+            if use_buckets is None:
+                use_buckets = False
+            if use_buckets and not fw_sorted and checkpointing:
+                restored = _read_buckets_manifest(run_dir)
+                if restored is not None:
+                    fw_sorted, bw_sorted = restored
 
-            print(f"Stage 4a: Computing right entropy (min_freq={min_freq})...")
-            if os.path.getsize(ngram_fw_sorted) > PARALLEL_ENTROPY_THRESHOLD:
-                count = _write_entropy_from_ngram_parallel(
+            logger.info("Stage 4a: Computing right entropy (min_freq=%d)...",
+                        min_freq)
+            if use_buckets:
+                r_count = _compute_entropy_from_sorted_list(
+                    fw_sorted, right_entropy_file, min_freq, direct=True,
+                    workers=workers,
+                )
+                # Per-bucket results are only group-sorted; re-sort for merge
+                sort_file_inplace(right_entropy_file)
+            elif os.path.getsize(ngram_fw_sorted) > PARALLEL_ENTROPY_MIN_BYTES:
+                r_count = _write_entropy_from_ngram_parallel(
                     ngram_fw_sorted, right_entropy_file, min_freq,
                     direct=True, workers=workers,
                 )
             else:
-                count = _write_entropy_from_ngram(
+                r_count = _write_entropy_from_ngram(
                     ngram_fw_sorted, right_entropy_file, min_freq, direct=True,
                 )
-            print(f"  Right: {count} unique words")
+            logger.info("  Right: %d unique words", r_count)
 
-            print(f"Stage 4b: Computing left entropy (min_freq={min_freq})...")
-            if os.path.getsize(ngram_bw_sorted) > PARALLEL_ENTROPY_THRESHOLD:
-                count = _write_entropy_from_ngram_parallel(
+            logger.info("Stage 4b: Computing left entropy (min_freq=%d)...",
+                        min_freq)
+            if use_buckets:
+                l_count = _compute_entropy_from_sorted_list(
+                    bw_sorted, left_entropy_unsorted, min_freq, direct=False,
+                    workers=workers,
+                )
+            elif os.path.getsize(ngram_bw_sorted) > PARALLEL_ENTROPY_MIN_BYTES:
+                l_count = _write_entropy_from_ngram_parallel(
                     ngram_bw_sorted, left_entropy_unsorted, min_freq,
                     direct=False, workers=workers,
                 )
             else:
-                count = _write_entropy_from_ngram(
-                    ngram_bw_sorted, left_entropy_unsorted, min_freq, direct=False,
+                l_count = _write_entropy_from_ngram(
+                    ngram_bw_sorted, left_entropy_unsorted, min_freq,
+                    direct=False,
                 )
-            print(f"  Left: {count} unique words")
+            logger.info("  Left: %d unique words", l_count)
 
-        print("Stage 4c: Sorting left entropy file...")
-        sort_file_inplace(left_entropy_unsorted)
-        os.rename(left_entropy_unsorted, left_entropy_file)
+            logger.info("Stage 4c: Sorting left entropy file...")
+            sort_file_inplace(left_entropy_unsorted)
+            os.replace(left_entropy_unsorted, left_entropy_file)
+            if checkpointing:
+                _ckpt_mark(run_dir, "entropy")
+            stage = 4
 
-        from dict_build.config import (
-            ENTROPY_THRESHOLD, PMI_THRESHOLD, POS_PROB_THRESHOLD,
-        )
+        if stage == 4:
+            logger.info("Stage 5: Merging left and right entropy...")
+            merged = merge_entropy_files_sorted(
+                right_entropy_file, left_entropy_file,
+                min_entropy=entropy_threshold,
+            )
+            logger.info("  Merged: %d candidates (entropy >= %s)",
+                        len(merged), entropy_threshold)
+            if checkpointing:
+                write_entropy_to_file(iter(merged), merged_file)
+                _ckpt_mark(run_dir, "merged")
+            stage = 5
 
-        print("Stage 5: Merging left and right entropy...")
-        merged = merge_entropy_files_sorted(
-            right_entropy_file, left_entropy_file,
-            min_entropy=ENTROPY_THRESHOLD,
-        )
-        print(f"  Merged: {len(merged)} candidates (entropy >= {ENTROPY_THRESHOLD})")
+        if stage == 5:
+            if merged is None:
+                merged = list(read_entropy_from_file(merged_file))
+                logger.info("Stage 5: Loaded %d merged candidates "
+                            "from checkpoint", len(merged))
 
-        if not merged:
-            print("  No candidates pass entropy threshold.")
-            with open(output_path, "w") as f:
-                f.write("word\tfreq\tpmi\tentropy\tpos_prob\tpos\n")
+            if not merged:
+                logger.info("  No candidates pass entropy threshold.")
+                _write_output([], output_path)
+                success = True
+                return output_path
+
+            logger.info("Stage 6a: Building frequency trie "
+                        "(stream from file)...")
+            trie, total_single = build_and_mmap_trie(
+                right_entropy_file, trie_file, min_freq=min_freq
+            )
+            logger.info("  Trie ready. Total single-char freq: %d",
+                        total_single)
+
+            logger.info("Stage 6b: Computing PMI and filtering...")
+            pos_prob = load_pos_prob(pos_prob_path)
+            results_raw = extract_words(
+                merged, pos_prob, trie, total_single,
+                pmi_threshold=pmi_threshold,
+                pos_threshold=pos_threshold,
+            )
+            logger.info("  Candidates after PMI/filter: %d", len(results_raw))
+            del trie  # release the mmap before work_dir cleanup (Windows)
+
+            from .pos_tag import tag_word
+
+            results = [
+                (w, f, p, e, pp, tag_word(w))
+                for w, f, p, e, pp in results_raw
+            ]
+
+            _write_output(results, output_path)
+            logger.info("Output: %s", output_path)
+            success = True
             return output_path
 
-        trie_file = os.path.join(temp_dir, "freq.trie")
-        print("Stage 6a: Building frequency trie (stream from file)...")
-        trie, total_single = build_and_mmap_trie(
-            right_entropy_file, trie_file, min_freq=min_freq
-        )
-        print(f"  Trie ready. Total single-char freq: {total_single}")
-
-        print("Stage 6b: Computing PMI and filtering...")
-        pos_prob = load_pos_prob(pos_prob_path)
-        results_raw = extract_words(
-            merged, pos_prob, trie, total_single,
-            pmi_threshold=PMI_THRESHOLD,
-            entropy_threshold=ENTROPY_THRESHOLD,
-            pos_threshold=POS_PROB_THRESHOLD,
-        )
-        print(f"  Candidates after PMI/filter: {len(results_raw)}")
-
-        # Attach POS tags via list comprehension
-        results = [
-            (w, f, p, e, pp, tag_word(w))
-            for w, f, p, e, pp in results_raw
-        ]
-
-        _write_output(results, output_path)
-        print(f"Output: {output_path}")
-        return output_path
+        raise RuntimeError(f"Invalid pipeline stage: {stage}")
 
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        if not checkpointing:
+            shutil.rmtree(run_dir, ignore_errors=True)
+        elif success:
+            _ckpt_clear(run_dir)
 
 
 # ---- N-gram generation: normal files (parallel) ----
@@ -550,10 +891,12 @@ def _generate_ngrams_parallel(
 ) -> tuple[list[str], list[str], str]:
     """Generate n-grams with multiprocessing, writing directly to temp files.
 
-    Returns (fw_tmp_paths, bw_tmp_paths, tmp_dir). Caller must process
-    the temp files and then delete tmp_dir.
+    Returns (fw_tmp_paths, bw_tmp_paths, tmp_dir). tmp_dir lives inside
+    the caller's temp_dir and is removed with it.
     """
-    ngram_tmp_dir = tempfile.mkdtemp(prefix="dict_build_ngrams_")
+    ngram_tmp_dir = tempfile.mkdtemp(
+        prefix="dict_build_ngrams_", dir=os.path.dirname(ngram_fw_path),
+    )
 
     # Estimate total chunks from file sizes (avoid reading every file twice)
     total_chunks = 0
@@ -561,10 +904,10 @@ def _generate_ngrams_parallel(
     for fp in txt_files:
         enc = _detect_file_encoding(fp)
         file_encodings[fp] = enc
-        est_lines = max(1, os.path.getsize(fp) // 100)
+        est_lines = max(1, os.path.getsize(fp) // AVG_LINE_BYTES)
         total_chunks += (est_lines + CHUNK_LINES - 1) // CHUNK_LINES
 
-    max_pending = workers * 4
+    max_pending = workers * PENDING_TASK_FACTOR
     fw_tmp_paths: list[str] = []
     bw_tmp_paths: list[str] = []
 
@@ -632,19 +975,48 @@ def _process_chunk_direct(
 ) -> None:
     """Process a chunk of lines, write n-grams directly to temp files.
 
-    No n-gram lists are accumulated in memory; each fragment is written
-    immediately. Worker memory = chunk text + file buffer (~ few MB).
+    No n-gram lists are accumulated in memory; writes are batched to
+    keep interpreter overhead low. Worker memory = chunk text + write
+    buffers (~ few MB).
     """
     with open(fw_path, "w", encoding="utf-8") as fw, \
          open(bw_path, "w", encoding="utf-8") as bw:
-        for line in lines:
-            for sent in preprocess_line(line):
-                for ng in generate_ngrams(sent, max_len):
-                    fw.write(ng)
-                    fw.write("\n")
-                for ng in generate_reverse_ngrams(sent, max_len):
-                    bw.write(ng)
-                    bw.write("\n")
+        _write_ngrams_batched(
+            (sent for line in lines for sent in preprocess_line(line)),
+            max_len, fw, bw,
+        )
+
+
+_NGRAM_WRITE_BATCH = NGRAM_WRITE_BATCH
+
+
+def _write_ngrams_batched(sentences, max_len: int, fw, bw) -> None:
+    """Generate n-grams for sentences and write with batched flushes."""
+    fw_buf: list[str] = []
+    bw_buf: list[str] = []
+    fw_append = fw_buf.append
+    bw_append = bw_buf.append
+    count = 0
+    for sent in sentences:
+        for ng in generate_ngrams(sent, max_len):
+            fw_append(ng)
+            fw_append("\n")
+        for ng in generate_reverse_ngrams(sent, max_len):
+            bw_append(ng)
+            bw_append("\n")
+        count += 1
+        if count >= 256:
+            count = 0
+            if len(fw_buf) >= _NGRAM_WRITE_BATCH:
+                fw.write("".join(fw_buf))
+                fw_buf.clear()
+            if len(bw_buf) >= _NGRAM_WRITE_BATCH:
+                bw.write("".join(bw_buf))
+                bw_buf.clear()
+    if fw_buf:
+        fw.write("".join(fw_buf))
+    if bw_buf:
+        bw.write("".join(bw_buf))
 
 
 def _read_chunks_by_lines(path: str, n: int, encoding: str = "utf-8"):
@@ -668,10 +1040,11 @@ def _generate_ngrams_single_line(
     max_len: int,
 ) -> None:
     encoding = _detect_file_encoding(filepath)
+    bytes_per_char = 2 if encoding in ("gb18030", "gbk", "big5") else 3
     fw_out = open(ngram_fw_path, "a", encoding="utf-8")
     bw_out = open(ngram_bw_path, "a", encoding="utf-8")
     try:
-        total_chars = os.path.getsize(filepath) // 3
+        total_chars = os.path.getsize(filepath) // bytes_per_char
         total_chunks = (total_chars + SINGLE_LINE_CHAR_CHUNK - 1) // SINGLE_LINE_CHAR_CHUNK
         pbar = tqdm.tqdm(total=total_chunks, desc="  S-line", unit="chunk")
 
@@ -716,13 +1089,7 @@ def _generate_ngrams_single_line(
 
 def _process_text_segment(text: str, max_len: int, fw_out, bw_out) -> None:
     """Preprocess a text segment and write n-grams directly."""
-    for sent in preprocess_line(text):
-        for ng in generate_ngrams(sent, max_len):
-            fw_out.write(ng)
-            fw_out.write("\n")
-        for ng in generate_reverse_ngrams(sent, max_len):
-            bw_out.write(ng)
-            bw_out.write("\n")
+    _write_ngrams_batched(preprocess_line(text), max_len, fw_out, bw_out)
 
 
 # ---- Entropy helpers ----
@@ -730,7 +1097,7 @@ def _process_text_segment(text: str, max_len: int, fw_out, bw_out) -> None:
 def _split_sorted_ngram_by_chars(
     ngram_file: str,
     output_dir: str,
-    chars_per_file: int = 10,
+    chars_per_file: int = ENTROPY_SPLIT_CHARS_PER_FILE,
 ) -> list[str]:
     """Split sorted n-gram file at first-character boundaries.
 
@@ -788,16 +1155,16 @@ def _write_entropy_from_ngram_parallel(
     min_freq: int,
     direct: bool,
     workers: int,
-    chars_per_file: int = 10,
+    chars_per_file: int = ENTROPY_SPLIT_CHARS_PER_FILE,
 ) -> int:
     """Split n-gram file by first-char groups, compute entropy in parallel."""
-    split_dir = tempfile.mkdtemp(prefix="dict_build_entropy_")
+    split_dir = tempfile.mkdtemp(prefix="dict_build_entropy_",
+                                 dir=os.path.dirname(output_file))
     try:
-        print("    Splitting by first-char groups...", end="", flush=True)
         split_paths = _split_sorted_ngram_by_chars(
             ngram_file, split_dir, chars_per_file,
         )
-        print(f" {len(split_paths)} chunks")
+        logger.info("    Split into %d first-char chunks", len(split_paths))
 
         total = 0
         with Pool(processes=workers) as pool:
@@ -842,8 +1209,13 @@ def _write_entropy_from_ngram(
 
 
 def _concat_temp_files(paths: list[str], output_path: str) -> None:
-    """Concatenate multiple files into one output."""
-    with open(output_path, "wb") as out:
+    """Concatenate multiple files into one output.
+
+    Appends when output_path already exists (single-line mode may have
+    written n-grams there before the parallel temp files are merged).
+    """
+    mode = "ab" if os.path.exists(output_path) else "wb"
+    with open(output_path, mode) as out:
         for tp in paths:
             with open(tp, "rb") as f:
                 shutil.copyfileobj(f, out)

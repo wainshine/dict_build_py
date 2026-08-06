@@ -7,6 +7,8 @@ Usage:
     python -m dict_build /path/to/dir/
 """
 
+import logging
+
 import click
 
 from .config import (
@@ -36,6 +38,19 @@ from .pipeline import run_pipeline
               help="Minimum entropy value.")
 @click.option("--pos-threshold", default=POS_PROB_THRESHOLD,
               help="Minimum position probability.")
+@click.option("--temp-dir", default=None,
+              type=click.Path(exists=True, file_okay=False, writable=True),
+              help="Parent directory for temporary intermediate files "
+                   "(default: system temp, override with TMPDIR env var).")
+@click.option("--work-dir", default=None,
+              type=click.Path(file_okay=False),
+              help="Persistent working directory: enables checkpointed "
+                   "resume after interruption.")
+@click.option("--force", is_flag=True,
+              help="Ignore existing checkpoints in --work-dir and start over.")
+@click.option("--verbose", "-v", is_flag=True, help="Debug-level logging.")
+@click.option("--quiet", "-q", is_flag=True, help="Only errors and the "
+              "progress bars.")
 def main(
     input_path: str,
     output: str | None,
@@ -47,6 +62,11 @@ def main(
     pmi_threshold: float,
     entropy_threshold: float,
     pos_threshold: float,
+    temp_dir: str | None,
+    work_dir: str | None,
+    force: bool,
+    verbose: bool,
+    quiet: bool,
 ) -> None:
     """Extract Chinese words/phrases from raw text using statistical NLP.
 
@@ -55,10 +75,12 @@ def main(
     Output format (tab-separated, sorted by frequency desc):
         word    freq    pmi    entropy    pos_prob    pos
     """
-    import dict_build.config as cfg
-    cfg.PMI_THRESHOLD = pmi_threshold
-    cfg.ENTROPY_THRESHOLD = entropy_threshold
-    cfg.POS_PROB_THRESHOLD = pos_threshold
+    level = logging.INFO
+    if verbose:
+        level = logging.DEBUG
+    elif quiet:
+        level = logging.ERROR
+    logging.basicConfig(format="%(message)s", level=level)
 
     run_pipeline(
         input_path=input_path,
@@ -68,6 +90,12 @@ def main(
         workers=workers,
         min_freq=min_freq,
         pos_prob_path=pos_prop,
+        temp_dir=temp_dir,
+        work_dir=work_dir,
+        force=force,
+        pmi_threshold=pmi_threshold,
+        entropy_threshold=entropy_threshold,
+        pos_threshold=pos_threshold,
     )
 
 

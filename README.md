@@ -1,6 +1,6 @@
 # dict_build_py
 
-版本 1.2.0 | 作者 wainshine | 协议 Apache-2.0
+版本 1.3.0 | 作者 wainshine | 协议 Apache-2.0
 
 从原始文本中自动发现中文新词，构建领域/行业专属词典。
 
@@ -36,6 +36,12 @@ python -m dict_build input.txt \
     --pmi-threshold 1.0 \
     --entropy-threshold 2.0 \
     --pos-threshold 0.1
+
+# 大任务：固定工作目录 + 断点续跑
+python -m dict_build huge_corpus.txt \
+    --work-dir /bigdisk/dict_build_work \
+    --temp-dir /bigdisk/tmp
+# 中断后直接重跑同一条命令即可从断点继续；--force 忽略断点重跑
 ```
 
 ### 参数
@@ -52,12 +58,17 @@ python -m dict_build input.txt \
 | `--pmi-threshold` | 1.0 | 互信息阈值 |
 | `--entropy-threshold` | 2.0 | 熵阈值 |
 | `--pos-threshold` | 0.1 | 位置成词概率阈值 |
+| `--temp-dir` | 系统临时目录 | 中间文件父目录（也可用 TMPDIR 环境变量） |
+| `--work-dir` | 无 | 固定工作目录，启用断点续跑 |
+| `--force` | 关 | 忽略 `--work-dir` 中的断点，从头重跑 |
+| `--verbose, -v` | 关 | 调试级日志 |
+| `--quiet, -q` | 关 | 只输出错误和进度条 |
 
 ### 支持的文件格式与编码
 
 格式：`.txt` `.csv` `.json` `.sql` `.md` `.html` `.htm`
 
-编码：UTF-8 / GBK / GB18030 / BIG5 自动检测。算法采用五步策略：UTF-8 严格解码优先 → CJK 比率启发式 → 多编码择优 → charset-normalizer 兜底。即使文件内部混有乱码字节，也能正确识别并恢复可读的中文部分。
+编码：UTF-8 / GBK / GB18030 / BIG5 自动检测（按文件逐个检测，头部/中部/尾部三处采样）。算法采用五步策略：UTF-8 严格解码优先 → CJK 比率启发式 → 多编码择优 → charset-normalizer 兜底。即使文件内部混有乱码字节、或 ASCII 头部配 GBK 正文（如数据库 dump），也能正确识别并恢复可读的中文部分。
 
 ### 自动适配
 
@@ -65,10 +76,16 @@ python -m dict_build input.txt \
 |------|---------|
 | 大单文件（多行） | 多进程分块，worker 直写临时文件（避 pickle 序列化），主进程拼接 |
 | 目录（多个文件） | 递归扫描，同上 |
-| 单行超大文件 | 自动检测（>100MB 且 ≤10 行），串行分块直写，UTF-8 边界回退容错 |
-| 超大 n-gram 中间文件 | 自适应哈希分桶排序 + 并行熵计算（>1GB 自动触发） |
+| 单行超大文件 | 自动检测（头/中/尾采样，>100MB 且 ≤10 行），串行分块直写，UTF-8 边界回退容错 |
+| 超大 n-gram 中间文件 | 自适应哈希分桶排序 + 并行熵计算（>1GB 自动触发，桶数上限 64） |
 
-> N-gram 阶段采用背压限流（在途任务 ≤ `workers × 4`），防止 Pool 队列积压；行数从文件大小估算（`size // 100`），不再两次读文件；CLI 阈值参数在函数调用时从 config 读取，传参必定生效。
+> N-gram 阶段采用背压限流（在途任务 ≤ `workers × 4`），防止 Pool 队列积压；行数从文件大小估算，不再两次读文件；熵计算为 O(1) 内存流式处理（输入已排序，逐词刷写）；启动前自动探测系统 `sort` 能力（GNU/BSD 自适应）并做磁盘空间预检（中间数据约输入的 8 倍）。
+
+### 断点续跑
+
+指定 `--work-dir` 后，各阶段（n-gram → 排序 → 熵 → 合并）完成时写入 `.done` 标记。进程中断（OOM、磁盘满、手动 kill）后重跑同一命令，自动从最后完成的阶段继续；输入文件或参数变化时自动放弃断点重跑。成功完成后自动清理中间文件；失败时保留现场供续跑。
+
+> 注意：在 macOS/Windows 上以库方式调用 `run_pipeline()` 时，入口需加 `if __name__ == "__main__":` 保护（multiprocessing spawn 模式要求）。
 
 ## 成词判定
 
@@ -196,7 +213,7 @@ dict_build_py/
 │   ├── pipeline.py       # 流程编排 + 编码检测 + 哈希分桶排序
 │   └── data/pos_prop.txt # 位置成词概率
 └── tests/
-    └── test_extract.py   # 57 个单元测试
+    └── test_extract.py   # 69 个单元测试
 ```
 
 ## 与 dict_build (Java) 版本的差异
@@ -210,7 +227,9 @@ dict_build_py/
 | 多格式输入 | 仅 .txt | .txt .csv .json .sql .md .html .htm |
 | 词性标注 | 无 | jieba 词典 O(1) 查词 |
 | 编码杂质过滤 | 无 | substring blocklist 自动过滤 |
-| 进度提示 | LOG 信息 | tqdm 全阶段进度条 + sort 实时进度 |
+| 进度提示 | LOG 信息 | tqdm 全阶段进度条 + logging 分级 |
+| 断点续跑 | 无 | --work-dir 阶段标记，中断后续跑 |
+| 磁盘安全 | 无 | 启动预检（中间数据 ≈ 输入 ×8）+ --temp-dir |
 | 内存优化 | ConcurrentRadixTree | marisa-trie mmap + worker 直写 |
 | 输出位置 | 原文件同目录 | 同目录 + 日期后缀 |
 | 算法核心 | N-gram + PMI + 左右熵 + 位置概率 | 完全一致 |
@@ -219,6 +238,7 @@ dict_build_py/
 
 | 版本 | 主要变更 |
 |------|---------|
+| 1.3.0 | 断点续跑（--work-dir/--force）、logging + --verbose/--quiet、磁盘预检 + --temp-dir、熵计算 O(1) 流式化、sort 能力探测（GNU/BSD 自适应）、编码检测三采样、混合输入丢数据等 3 个 P0 修复、阈值改显式传参、测试 57→69 |
 | 1.2.0 | 哈希分桶排序（300GB n-gram 2h→20min）、编码检测 v5 重写、编码杂质过滤、测试 38→57 |
 | 1.1.0 | 熵计算并行化、GBK/GB18030 自动检测、worker 直写 temp 文件、背压限流 |
 | 1.0.0 | 首版，多进程 N-gram、系统 sort 并行、词性标注、CLI 阈值修复 |

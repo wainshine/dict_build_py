@@ -1,7 +1,10 @@
 """Frequency and entropy calculation from sorted n-gram files.
 
-Memory-efficient approach: split sorted n-gram file by first character,
-process each part independently, then merge results.
+Streaming approach: the n-gram file is byte-sorted (LC_ALL=C), and the
+TAB separator (0x09) sorts before any word character, so all lines for
+the same word are adjacent. Each word's suffix counts are flushed as
+soon as the word changes — memory is O(distinct suffixes per word),
+independent of corpus size.
 """
 
 import math
@@ -20,10 +23,12 @@ def compute_entropy_from_sorted(
 ) -> Iterator[tuple[str, int, float]]:
     """Process sorted n-gram lines, yield (word, freq, entropy).
 
-    Groups by first character for memory efficiency.
+    Input must be sorted so that all lines for a word are adjacent
+    (guaranteed by LC_ALL=C byte sort of "word<TAB>suffix" lines).
     """
-    group: dict[str, dict[str, int]] = {}
-    current_first_char = ""
+    current_word: str | None = None
+    suffix_counts: dict[str, int] = {}
+    total = 0
 
     for line in lines:
         tab_pos = line.find("\t")
@@ -34,21 +39,24 @@ def compute_entropy_from_sorted(
         if not word:
             continue
 
-        first_char = word[0]
-        if first_char != current_first_char:
-            if group:
-                yield from _flush_group(group, min_freq, min_entropy)
-                group.clear()
-            current_first_char = first_char
+        if word != current_word:
+            if current_word is not None:
+                result = _score_word(current_word, suffix_counts, total,
+                                     min_freq, min_entropy)
+                if result is not None:
+                    yield result
+                suffix_counts.clear()
+                total = 0
+            current_word = word
 
-        word_map = group.get(word)
-        if word_map is None:
-            group[word] = {suffix: 1}
-        else:
-            word_map[suffix] = word_map.get(suffix, 0) + 1
+        suffix_counts[suffix] = suffix_counts.get(suffix, 0) + 1
+        total += 1
 
-    if group:
-        yield from _flush_group(group, min_freq, min_entropy)
+    if current_word is not None:
+        result = _score_word(current_word, suffix_counts, total,
+                             min_freq, min_entropy)
+        if result is not None:
+            yield result
 
 
 def compute_entropy_from_sorted_left(
@@ -64,22 +72,23 @@ def compute_entropy_from_sorted_left(
         yield (word[::-1], freq, entropy)
 
 
-def _flush_group(
-    group: dict[str, dict[str, int]],
+def _score_word(
+    word: str,
+    suffix_counts: dict[str, int],
+    total: int,
     min_freq: int,
     min_entropy: float,
-) -> Iterator[tuple[str, int, float]]:
-    for word, suffix_counts in group.items():
-        total = sum(suffix_counts.values())
-        if total < min_freq:
-            continue
-        entropy = 0.0
-        for count in suffix_counts.values():
-            if count > 0:
-                p = count / total
-                entropy -= p * math.log2(p)
-        if entropy >= min_entropy:
-            yield (word, total, entropy)
+) -> tuple[str, int, float] | None:
+    if total < min_freq:
+        return None
+    entropy = 0.0
+    for count in suffix_counts.values():
+        if count > 0:
+            p = count / total
+            entropy -= p * math.log2(p)
+    if entropy < min_entropy:
+        return None
+    return (word, total, entropy)
 
 
 # ---- File I/O helpers ----
@@ -98,17 +107,29 @@ def write_entropy_to_file(
 
 
 def read_entropy_from_file(filepath: str) -> Iterator[tuple[str, int, float]]:
-    """Read entropy tuples from a tab-separated file."""
+    """Read entropy tuples from a tab-separated file.
+
+    Lines with unparseable freq/entropy values (e.g. from an interrupted
+    previous run) are skipped instead of aborting the whole merge.
+    """
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             line = line.rstrip("\n\r")
             parts = line.split("\t")
-            if len(parts) == 3:
+            if len(parts) != 3:
+                continue
+            try:
                 yield (parts[0], int(parts[1]), float(parts[2]))
+            except ValueError:
+                continue
 
 
 def sort_file_inplace(filepath: str) -> None:
-    """Sort a file in-place using system sort."""
+    """Sort a file in-place using system sort.
+
+    Without a system sort, falls back to in-memory sorting for small
+    files only; large files raise a clear error instead of OOM-ing.
+    """
     if shutil.which("sort") is not None:
         subprocess.run(
             ["sort", "-o", filepath, filepath],
@@ -116,6 +137,12 @@ def sort_file_inplace(filepath: str) -> None:
             env={**os.environ, "LC_ALL": "C"},
         )
     else:
+        if os.path.getsize(filepath) > 256 * 1024 * 1024:
+            raise RuntimeError(
+                f"Cannot sort {filepath}: no system 'sort' available and "
+                f"file exceeds 256 MB in-memory fallback limit. "
+                f"Install GNU coreutils (or run on Linux/macOS)."
+            )
         with open(filepath, "r", encoding="utf-8") as f:
             lines = f.readlines()
         lines.sort(key=lambda s: s.encode("utf-8"))
@@ -132,7 +159,10 @@ def merge_entropy_files_sorted(
 ) -> list[tuple[str, int, float]]:
     """Merge sorted right and left entropy files, taking min(entropy).
 
-    Both files must be sorted by word.
+    Both files must be sorted by word. The merge compares Python str
+    directly: this is correct because all entropy files are UTF-8 and
+    UTF-8 byte order (used by LC_ALL=C sort) equals code-point order.
+    Do not switch to locale-aware sorting without revisiting this.
     """
     r_iter = read_entropy_from_file(right_file)
     l_iter = read_entropy_from_file(left_file)

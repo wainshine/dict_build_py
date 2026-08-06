@@ -6,7 +6,10 @@ M = probability char appears in Middle of word
 E = probability char appears at End of word
 """
 
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 
 
 def load_pos_prob(filepath: str | None = None) -> dict[str, tuple[float, float, float]]:
@@ -33,6 +36,6 @@ def load_pos_prob(filepath: str | None = None) -> dict[str, tuple[float, float, 
                 except ValueError:
                     continue
     except FileNotFoundError:
-        print(f"  ⚠ Position-probability file not found: {filepath}")
-        print(f"    Words will not be filtered by position probability.")
+        logger.warning("Position-probability file not found: %s", filepath)
+        logger.warning("Words will not be filtered by position probability.")
     return result

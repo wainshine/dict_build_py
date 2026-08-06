@@ -9,7 +9,7 @@ import math
 import marisa_trie
 import tqdm
 
-from .preprocess import is_chinese
+from .preprocess import all_chinese
 from .entropy import read_entropy_from_file
 from .config import WORD_BLOCKLIST_SUBSTRINGS
 
@@ -29,22 +29,22 @@ def build_and_mmap_trie(
     Returns:
         (mmap-loaded trie, total_single_char_freq).
     """
-    pairs: list[tuple[str, tuple[int, ...]]] = []
     total_single = 0
 
-    for word, freq, _entropy in read_entropy_from_file(entropy_file):
-        if not word or freq < min_freq:
-            continue
-        if not all(is_chinese(c) for c in word):
-            continue
-        pairs.append((word, (freq,)))
-        if len(word) == 1:
-            total_single += freq
+    def _iter_pairs():
+        nonlocal total_single
+        for word, freq, _entropy in read_entropy_from_file(entropy_file):
+            if not word or freq < min_freq:
+                continue
+            if not all_chinese(word):
+                continue
+            if len(word) == 1:
+                total_single += freq
+            yield (word, (freq,))
 
-    trie = marisa_trie.RecordTrie("I", pairs)
+    trie = marisa_trie.RecordTrie("I", _iter_pairs())
     trie.save(trie_file)
 
-    del pairs
     del trie
 
     trie_mmap = marisa_trie.RecordTrie("I").mmap(trie_file)
@@ -90,10 +90,12 @@ def extract_words(
     trie: marisa_trie.RecordTrie,
     total_single: int,
     pmi_threshold: float,
-    entropy_threshold: float,
     pos_threshold: float,
 ) -> list[tuple[str, int, float, float, float]]:
     """Filter and score candidate words.
+
+    When pos_prob is empty (pos_prop file missing), the position filter
+    is skipped and pos_prob is reported as 0.0.
 
     Returns list of (word, freq, pmi, entropy, pos_prob) sorted by freq desc.
     """
@@ -109,16 +111,17 @@ def extract_words(
         if pmi < pmi_threshold:
             continue
 
-        first_char = word[0]
-        last_char = word[-1]
         pp = 0.0
-        if first_char in pos_prob and last_char in pos_prob:
-            p_first_s = pos_prob[first_char][0]
-            p_last_e = pos_prob[last_char][2]
-            pp = min(p_first_s, p_last_e)
+        if pos_prob:
+            first_char = word[0]
+            last_char = word[-1]
+            if first_char in pos_prob and last_char in pos_prob:
+                p_first_s = pos_prob[first_char][0]
+                p_last_e = pos_prob[last_char][2]
+                pp = min(p_first_s, p_last_e)
 
-        if pp < pos_threshold:
-            continue
+            if pp < pos_threshold:
+                continue
 
         if any(p in word for p in WORD_BLOCKLIST_SUBSTRINGS):
             continue

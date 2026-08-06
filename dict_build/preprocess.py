@@ -5,15 +5,17 @@ from typing import Iterator
 
 from .config import SENTINEL, STOPWORDS
 
-_PUNCT_PATTERN = re.compile(r"[\p{P}\p{S}\p{Z}\p{C}\p{M}\u3000]")
-_STOPWORD_TABLE = str.maketrans({c: " " for c in STOPWORDS})
-_CHINESE_RE = re.compile(r"[\u4e00-\u9fa5]+")
+# Punctuation/symbols/whitespace/control chars and stopwords all become
+# sentence boundaries in a single regex pass.
+_PUNCT_PATTERN = re.compile(
+    r"[\p{P}\p{S}\p{Z}\p{C}\p{M}　" + re.escape("".join(STOPWORDS)) + r"]"
+)
+_CHINESE_RE = re.compile(r"[一-龥]+")
 
 
 def preprocess_line(line: str) -> Iterator[str]:
     """Process a single line of text, yield cleaned Chinese sentences."""
     line = _PUNCT_PATTERN.sub(" ", line)
-    line = line.translate(_STOPWORD_TABLE)
     for match in _CHINESE_RE.finditer(line):
         token = match.group()
         if len(token) >= 2:
