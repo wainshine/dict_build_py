@@ -1,13 +1,26 @@
 """Tests for dict_build."""
-import io
 import os
 import shutil
+import subprocess
 import tempfile
 
 import pytest
 
+
+def _has_usable_sort() -> bool:
+    """True only for GNU/BSD sort (Windows System32 sort.exe fails --version)."""
+    exe = shutil.which("sort")
+    if exe is None:
+        return False
+    try:
+        return subprocess.run([exe, "--version"], capture_output=True,
+                              timeout=5).returncode == 0
+    except Exception:
+        return False
+
+
 requires_sort = pytest.mark.skipif(
-    shutil.which("sort") is None, reason="system sort not available",
+    not _has_usable_sort(), reason="usable system sort not available",
 )
 
 from dict_build.preprocess import preprocess_line, is_chinese, all_chinese
@@ -1031,5 +1044,81 @@ def test_cli_rejects_bad_mem():
     from click.testing import CliRunner
     from dict_build.__main__ import main
 
-    result = CliRunner().invoke(main, ["--mem", "0", "x.txt"])
-    assert result.exit_code != 0
+    with tempfile.TemporaryDirectory() as tmp:
+        corpus = _make_text_file(tmp, "x.txt", "天下太平\n")
+        result = CliRunner().invoke(main, ["--mem", "0", corpus])
+        assert result.exit_code != 0
+        assert "--mem" in result.output
+
+
+# ============================================================
+# 1.4.1 helpers
+# ============================================================
+
+def test_shard_list_basic():
+    from dict_build.pipeline import _shard_list
+
+    shards = _shard_list(["a", "b", "c", "d", "e"], 2)
+    assert shards == [["a", "c", "e"], ["b", "d"]]
+    assert _shard_list(["a"], 8) == [["a"]]
+
+
+def test_shard_list_empty():
+    from dict_build.pipeline import _shard_list
+
+    assert _shard_list([], 4) == []
+
+
+def test_read_samples():
+    from dict_build.pipeline import _read_samples
+
+    with tempfile.TemporaryDirectory() as tmp:
+        small = _make_text_file(tmp, "s.txt", "天下太平")
+        assert len(_read_samples(small)) == 1
+
+        big = os.path.join(tmp, "big.txt")
+        with open(big, "wb") as f:
+            f.write(os.urandom(300 * 1024))
+        samples = _read_samples(big)
+        assert len(samples) == 3
+        assert all(len(s) == 64 * 1024 for s in samples)
+
+
+def test_decode_utf8_tolerant_leading_split():
+    from dict_build.pipeline import _decode_utf8_tolerant
+
+    # sample starts with the trailing 2 bytes of a 3-byte char
+    full = "天地下".encode("utf-8")
+    sample = full[1:]  # starts mid-"天"
+    assert _decode_utf8_tolerant(sample) == "地下"
+
+
+def test_process_text_with_carry_bounded(monkeypatch):
+    """pending must stay bounded on punctuation-free input (no O(n²)/OOM)."""
+    import dict_build.pipeline as pl
+
+    monkeypatch.setattr(pl, "SINGLE_LINE_PENDING_MAX_CHARS", 64)
+    fw = tempfile.SpooledTemporaryFile(mode="w", encoding="utf-8")
+    bw = tempfile.SpooledTemporaryFile(mode="w", encoding="utf-8")
+
+    pending = ""
+    for _ in range(20):  # 20 x 100 chars of unpunctuated Chinese
+        pending = pl._process_text_with_carry("天地玄黄宇宙洪荒" * 12 + "天地",
+                                              4, fw, bw, pending)
+        assert len(pending) <= 64 + 100  # cap + one chunk's addition
+
+    # flushed output contains real n-grams
+    fw.seek(0)
+    assert "天地\t" in fw.read()
+
+
+def test_process_text_with_carry_eof_flush():
+    """A trailing token at EOF is emitted by the caller's flush logic."""
+    import dict_build.pipeline as pl
+
+    fw = tempfile.SpooledTemporaryFile(mode="w", encoding="utf-8")
+    bw = tempfile.SpooledTemporaryFile(mode="w", encoding="utf-8")
+    pending = pl._process_text_with_carry("天地玄黄。", 4, fw, bw, "")
+    assert pending == ""  # terminated by punctuation: nothing to carry
+    pending = pl._process_text_with_carry("宇宙洪荒", 4, fw, bw, pending)
+    assert pending == "宇宙洪荒"  # unterminated: held back for EOF flush

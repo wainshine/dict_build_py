@@ -32,7 +32,7 @@ from .config import (
     BUCKET_DISTRIBUTE_BATCH, BUCKET_BUF_MIN_BYTES, BUCKET_BUF_MAX_BYTES,
     PARALLEL_ENTROPY_MIN_BYTES, ENTROPY_SPLIT_MIN_BYTES,
     SINGLE_LINE_MIN_BYTES, SINGLE_LINE_MAX_NEWLINES,
-    SINGLE_LINE_SAMPLE_BYTES,
+    SINGLE_LINE_SAMPLE_BYTES, SINGLE_LINE_PENDING_MAX_CHARS,
     ENCODING_SAMPLE_BYTES, CJK_RATIO_UTF8_MIN, CJK_RATIO_WINNER_MIN,
 )
 from .preprocess import preprocess_line, iter_chinese_tokens
@@ -44,6 +44,7 @@ from .entropy import (
     sort_file_inplace,
     iter_merge_entropy_files_sorted,
     read_entropy_from_file,
+    _sort_command,
 )
 from .pmi import build_and_mmap_trie, extract_words
 from .pos_prob import load_pos_prob
@@ -53,50 +54,6 @@ logger = logging.getLogger(__name__)
 TEXT_EXTENSIONS = {".txt", ".csv", ".json", ".sql", ".md", ".html", ".htm"}
 SINGLE_LINE_CHAR_CHUNK = 200_000
 BYTE_BUF = 8 * 1024 * 1024
-
-# Probed lazily: (sort_executable, supports_gnu_flags)
-_SORT_CAPS: tuple[str, bool] | None = None
-
-
-def _sort_command(mem_mb: int, workers: int,
-                  tmp_dir: str | None = None) -> list[str]:
-    """Build a system sort command, probing capabilities once per process.
-
-    GNU sort gets -S/--parallel; BSD sort gets plain flags (it accepts
-    but ignores -S on some versions, and silently ignores invalid
-    memsize units, so flags are only passed when the probe succeeds).
-    -T pins sort's own temp files to tmp_dir so --temp-dir/--work-dir
-    actually govern the sort stage (POSIX: supported by GNU and BSD).
-    Raises RuntimeError when no sort executable is available.
-    """
-    global _SORT_CAPS
-    if _SORT_CAPS is None:
-        exe = shutil.which("sort")
-        if exe is None:
-            raise RuntimeError(
-                "System 'sort' command not found. Install GNU coreutils "
-                "(or run on Linux/macOS) to process large files."
-            )
-        gnu = False
-        try:
-            r = subprocess.run(
-                [exe, "-S", "1M", "--parallel=2"],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, timeout=10,
-            )
-            gnu = r.returncode == 0
-        except Exception:
-            gnu = False
-        _SORT_CAPS = (exe, gnu)
-
-    exe, gnu = _SORT_CAPS
-    cmd = [exe]
-    if gnu:
-        cmd += ["-S", f"{max(1, mem_mb)}M", f"--parallel={max(1, workers)}"]
-    if tmp_dir is not None:
-        cmd += ["-T", tmp_dir]
-    return cmd
-
 
 def _read_samples(filepath: str, sample_size: int = ENCODING_SAMPLE_BYTES) -> list[bytes]:
     """Read head/middle/tail samples of a file for encoding detection."""
@@ -114,10 +71,18 @@ def _read_samples(filepath: str, sample_size: int = ENCODING_SAMPLE_BYTES) -> li
 
 
 def _decode_utf8_tolerant(sample: bytes) -> str:
-    """Strict UTF-8 decode, tolerating a character split at the sample edge.
+    """Strict UTF-8 decode, tolerating a character split at either edge.
 
-    Raises UnicodeDecodeError if the failure is not at the trailing edge.
+    A mid/tail sample may start with up to 3 continuation bytes (the
+    tail of a character that began before the sample) and may end
+    mid-character. Raises UnicodeDecodeError if the failure is not at
+    the sample edges.
     """
+    start = 0
+    while (start < 3 and start < len(sample)
+           and sample[start] & 0xC0 == 0x80):
+        start += 1
+    sample = sample[start:]
     for trim in range(0, 4):
         try:
             return sample[:len(sample) - trim].decode("utf-8") if trim else sample.decode("utf-8")
@@ -193,21 +158,6 @@ def _detect_file_encoding(filepath: str) -> str:
 
     return best_enc
 
-    # Still inconclusive — try charset_normalizer
-    try:
-        import charset_normalizer
-        result = charset_normalizer.from_path(
-            filepath,
-            preemptive_behaviour=False,
-        )
-        best = result.best()
-        if best and best.encoding:
-            return best.encoding
-    except Exception:
-        pass
-
-    return best_enc
-
 
 # ---- Bucket-sort helpers ----
 
@@ -265,7 +215,7 @@ def _distribute_batches(
     Bucket files are named {fw|bw}{shard}_b{NNNN}.txt so multiple
     distribution processes can write disjoint shard sets concurrently.
     """
-    crc32 = zlib.crc32
+    hash_line = _hash_line
     for batch_start in range(0, len(paths), batch_size):
         batch = paths[batch_start:batch_start + batch_size]
         fw_bh = [open(os.path.join(bucket_dir, f"fw{shard}_b{i:04d}.txt"), "ab")
@@ -294,9 +244,7 @@ def _distribute_batches(
                     for line in lines:
                         if not line or line == b"\r":
                             continue
-                        tab = line.find(b"\t")
-                        key = line[:tab] if tab > 0 else line
-                        h = (crc32(key) & 0x7FFFFFFF) % num_buckets
+                        h = hash_line(line) % num_buckets
                         writes[h](line)
                         writes[h](b"\n")
                         if tells[h]() >= buf_limit:
@@ -304,9 +252,7 @@ def _distribute_batches(
                             bufs[h].seek(0)
                             bufs[h].truncate()
                 if carry and carry != b"\r":
-                    tab = carry.find(b"\t")
-                    key = carry[:tab] if tab > 0 else carry
-                    h = (crc32(key) & 0x7FFFFFFF) % num_buckets
+                    h = hash_line(carry) % num_buckets
                     writes[h](carry)
                     writes[h](b"\n")
             os.remove(tp)
@@ -322,6 +268,8 @@ def _distribute_batches(
 
 def _shard_list(paths: list[str], n: int) -> list[list[str]]:
     """Split paths into n round-robin shards (temp files are ~equal size)."""
+    if not paths:
+        return []
     n = max(1, min(n, len(paths)))
     return [paths[i::n] for i in range(n)]
 
@@ -345,8 +293,15 @@ def _distribute_and_sort_ngrams(
     """
     bucket_dir = tempfile.mkdtemp(prefix="dict_build_buckets_",
                                    dir=temp_dir)
+    if not fw_tmp_paths and not bw_tmp_paths:
+        return [], []
 
-    num_dist = max(2, workers)
+    mem_bytes = mem_mb * 1024 * 1024
+    # Keep distribution processes affordable: each holds up to
+    # num_buckets x BUCKET_BUF_MIN_BYTES at the floor.
+    max_affordable = max(
+        2, (mem_bytes // 2) // (max(num_buckets, 1) * BUCKET_BUF_MIN_BYTES))
+    num_dist = min(max(2, workers), max_affordable)
     fw_shards = _shard_list(fw_tmp_paths,
                             max(1, min(len(fw_tmp_paths), num_dist // 2)))
     bw_shards = _shard_list(bw_tmp_paths,
@@ -506,25 +461,26 @@ def _ckpt_clear(run_dir: str) -> None:
             pass
     for entry in os.scandir(run_dir):
         if entry.is_dir(follow_symlinks=False) and entry.name.startswith(
-                ("dict_build_ngrams_", "dict_build_buckets_")):
+                ("dict_build_ngrams_", "dict_build_buckets_",
+                 "dict_build_entropy_")):
             shutil.rmtree(entry.path, ignore_errors=True)
 
 
 def _ckpt_read_meta(run_dir: str) -> dict | None:
     try:
-        with open(os.path.join(run_dir, _META_FILE)) as f:
+        with open(os.path.join(run_dir, _META_FILE), encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
         return None
 
 
 def _ckpt_write_meta(run_dir: str, meta: dict) -> None:
-    with open(os.path.join(run_dir, _META_FILE), "w") as f:
+    with open(os.path.join(run_dir, _META_FILE), "w", encoding="utf-8") as f:
         json.dump(meta, f)
 
 
 def _write_list_file(path: str, items: list[str]) -> None:
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         for item in items:
             f.write(item + "\n")
 
@@ -532,7 +488,7 @@ def _write_list_file(path: str, items: list[str]) -> None:
 def _read_list_file(path: str) -> list[str] | None:
     """Read a path list; None if the manifest or any listed file is missing."""
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             items = [line.strip() for line in f if line.strip()]
     except OSError:
         return None
@@ -593,7 +549,10 @@ def run_pipeline(
             are kept on failure and cleaned on success.
         force: Ignore existing checkpoints in work_dir and start over.
         pmi_threshold: Minimum PMI for a candidate word.
-        entropy_threshold: Minimum min(left, right) entropy.
+        entropy_threshold: Minimum min(left, right) entropy. Part of the
+            checkpoint signature: changing it on resume discards all
+            checkpoints (pmi/pos thresholds may change freely — they are
+            only applied in the final stage, which always re-runs).
         pos_threshold: Minimum position formation probability.
 
     Note:
@@ -617,6 +576,7 @@ def run_pipeline(
         if temp_dir is not None:
             logger.warning("--temp-dir is ignored when --work-dir is set; "
                            "intermediate files go to the work directory.")
+        work_dir = os.path.abspath(work_dir)
         os.makedirs(work_dir, exist_ok=True)
         run_dir = work_dir
         if force:
@@ -1039,9 +999,6 @@ def _process_chunk_direct(
         )
 
 
-_NGRAM_WRITE_BATCH = NGRAM_WRITE_BATCH
-
-
 def _write_ngrams_batched(sentences, max_len: int, fw, bw) -> None:
     """Generate n-grams for sentences and write with batched flushes."""
     fw_buf: list[str] = []
@@ -1059,10 +1016,10 @@ def _write_ngrams_batched(sentences, max_len: int, fw, bw) -> None:
         count += 1
         if count >= 256:
             count = 0
-            if len(fw_buf) >= _NGRAM_WRITE_BATCH:
+            if len(fw_buf) >= NGRAM_WRITE_BATCH:
                 fw.write("".join(fw_buf))
                 fw_buf.clear()
-            if len(bw_buf) >= _NGRAM_WRITE_BATCH:
+            if len(bw_buf) >= NGRAM_WRITE_BATCH:
                 bw.write("".join(bw_buf))
                 bw_buf.clear()
     if fw_buf:
@@ -1171,6 +1128,20 @@ def _process_text_with_carry(
             tokens.pop()
     sents = (SENTINEL + t + SENTINEL for t, _, _ in tokens if len(t) >= 2)
     _write_ngrams_batched(sents, max_len, fw_out, bw_out)
+
+    # Unpunctuated input (e.g. concatenated classical text) makes the
+    # trailing token grow without bound — flush the head as its own
+    # sentence once past the cap, carrying only max_len-1 chars of
+    # context. This approximates the boundary context with a sentinel
+    # and may duplicate a few tail n-grams per flush: statistically
+    # negligible, and it keeps memory bounded.
+    if len(pending) > SINGLE_LINE_PENDING_MAX_CHARS:
+        keep = max(1, max_len - 1)
+        head = pending[:-keep]
+        pending = pending[-keep:]
+        if len(head) >= 2:
+            _write_ngrams_batched(iter([SENTINEL + head + SENTINEL]),
+                                  max_len, fw_out, bw_out)
     return pending
 
 

@@ -1,6 +1,6 @@
 # dict_build_py
 
-版本 1.4.0 | 作者 wainshine | 协议 Apache-2.0
+版本 1.4.1 | 作者 wainshine | 协议 Apache-2.0
 
 从原始文本中自动发现中文新词，构建领域/行业专属词典。
 
@@ -41,8 +41,7 @@ python -m dict_build input.txt \
 
 # 大任务：固定工作目录 + 断点续跑
 python -m dict_build huge_corpus.txt \
-    --work-dir /bigdisk/dict_build_work \
-    --temp-dir /bigdisk/tmp
+    --work-dir /bigdisk/dict_build_work
 # 中断后直接重跑同一条命令即可从断点继续；--force 忽略断点重跑
 ```
 
@@ -107,20 +106,20 @@ python -m dict_build huge_corpus.txt \
 ```
 输入文件
   │
-  ├─ 编码检测（UTF-8 → CJK比率 → GB18030/GBK/BIG5 → charset-normalizer）
+  ├─ 编码检测（头/中/尾三采样：UTF-8 → CJK比率 → GB18030/GBK/BIG5 → charset-normalizer）
   │
   ├─ 预处理: 正则清洗 + 停用词过滤 + 中文分句 + 哨兵填充
   │
   ├─ N-gram 生成: 正向(右熵) + 反向(左熵), 1~max_len 字滑动窗口
-  │    └─ worker 直写 temp 文件，主进程拼接，无 pickle 序列化
+  │    └─ worker 直写 temp 文件（避 pickle 序列化），批量刷写
   │
-  ├─ 哈希分桶排序（>1GB 自动触发）
-  │    └─ hash(word) 分流到 N 个桶 → 每桶独立并行 sort → 拼接
+  ├─ 哈希分桶排序（>1GB 自动触发，桶数上限 64）
+  │    └─ crc32(word) 多进程分片分流到 N 个桶 → 每桶 sort 原生归并分片
   │
-  ├─ 频率 + 左右熵: 按首字分组流式计算 Shannon 熵
-  │    └─ 桶文件可直接并行计算，无需二次拆分
+  ├─ 频率 + 左右熵: O(1) 内存流式计算 Shannon 熵
+  │    └─ 右熵: 桶输出 k-way merge（免二次排序）; 左熵: 拼接后重排
   │
-  ├─ 熵合并: 取 min(左熵, 右熵)
+  ├─ 熵合并: 流式归并取 min(左熵, 右熵)，边归并边写盘
   │
   ├─ PMI + 位置概率 + 编码杂质过滤: marisa-trie (mmap) + pos_prop.txt
   │
@@ -215,7 +214,7 @@ dict_build_py/
 │   ├── pipeline.py       # 流程编排 + 编码检测 + 哈希分桶排序
 │   └── data/pos_prop.txt # 位置成词概率
 └── tests/
-    └── test_extract.py   # 75 个单元测试
+    └── test_extract.py   # 81 个单元测试
 ```
 
 ## 与 dict_build (Java) 版本的差异
@@ -240,6 +239,7 @@ dict_build_py/
 
 | 版本 | 主要变更 |
 |------|---------|
+| 1.4.1 | 单行模式 pending 上限冲刷（修无标点巨文件 O(n²)/OOM，P1）、编码检测采样边界容错、清理死代码、manifest 统一 UTF-8、work_dir 绝对化、sort_file_inplace 并入能力探测体系、测试 75→81 |
 | 1.4.0 | 分桶右熵 k-way merge（省一趟全量 sort）、桶分发多进程分片（2→workers 进程，实测 1.7×）、merge 阶段全流式、熵并行切分按字节均衡（消除热首字倾斜）、分桶路径端到端 + 续跑测试、CLI 参数范围校验、GitHub Actions CI（Linux/macOS/Windows）、测试 70→75 |
 | 1.3.0 | 断点续跑（--work-dir/--force）、logging + --verbose/--quiet、磁盘预检 + --temp-dir（sort -T 同步生效）、熵计算 O(1) 流式化、sort 能力探测 + 双排序内存均分、编码检测三采样、单行模式跨段词召回修复、混合输入丢数据等 P0 修复、阈值改显式传参、测试 57→70 |
 | 1.2.0 | 哈希分桶排序（300GB n-gram 2h→20min）、编码检测 v5 重写、编码杂质过滤、测试 38→57 |

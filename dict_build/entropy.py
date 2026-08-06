@@ -13,6 +13,57 @@ import shutil
 import subprocess
 from typing import Iterator
 
+from .config import FALLBACK_SORT_MAX_BYTES
+
+
+# ---- System sort ----
+
+# Probed lazily: (sort_executable, supports_gnu_flags)
+_SORT_CAPS: tuple[str, bool] | None = None
+
+
+def _sort_command(mem_mb: int | None = None, workers: int = 1,
+                  tmp_dir: str | None = None) -> list[str]:
+    """Build a system sort command, probing capabilities once per process.
+
+    GNU sort gets -S/--parallel; BSD sort gets plain flags (it accepts
+    but ignores -S on some versions, and silently ignores invalid
+    memsize units, so flags are only passed when the probe succeeds).
+    -T pins sort's own temp files to tmp_dir so --temp-dir/--work-dir
+    actually govern the sort stage (POSIX: supported by GNU and BSD).
+    Raises RuntimeError when no sort executable is available.
+    """
+    global _SORT_CAPS
+    if _SORT_CAPS is None:
+        exe = shutil.which("sort")
+        if exe is None:
+            raise RuntimeError(
+                "System 'sort' command not found. Install GNU coreutils "
+                "(or run on Linux/macOS) to process large files."
+            )
+        gnu = False
+        try:
+            r = subprocess.run(
+                [exe, "-S", "1M", "--parallel=2"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=10,
+            )
+            gnu = r.returncode == 0
+        except Exception:
+            gnu = False
+        _SORT_CAPS = (exe, gnu)
+
+    exe, gnu = _SORT_CAPS
+    cmd = [exe]
+    if gnu:
+        if mem_mb:
+            cmd += ["-S", f"{max(1, mem_mb)}M"]
+        if workers > 1:
+            cmd += [f"--parallel={workers}"]
+    if tmp_dir is not None:
+        cmd += ["-T", tmp_dir]
+    return cmd
+
 
 # ---- Core entropy computation ----
 
@@ -127,27 +178,33 @@ def read_entropy_from_file(filepath: str) -> Iterator[tuple[str, int, float]]:
 def sort_file_inplace(filepath: str) -> None:
     """Sort a file in-place using system sort.
 
-    Without a system sort, falls back to in-memory sorting for small
-    files only; large files raise a clear error instead of OOM-ing.
+    Falls back to in-memory sorting for small files when the system sort
+    is missing or fails (e.g. Windows sort.exe); large files raise a
+    clear error instead of OOM-ing.
     """
     if shutil.which("sort") is not None:
-        subprocess.run(
-            ["sort", "-o", filepath, filepath],
-            check=True,
-            env={**os.environ, "LC_ALL": "C"},
-        )
-    else:
-        if os.path.getsize(filepath) > 256 * 1024 * 1024:
-            raise RuntimeError(
-                f"Cannot sort {filepath}: no system 'sort' available and "
-                f"file exceeds 256 MB in-memory fallback limit. "
-                f"Install GNU coreutils (or run on Linux/macOS)."
+        try:
+            subprocess.run(
+                [*_sort_command(tmp_dir=os.path.dirname(filepath)),
+                 "-o", filepath, filepath],
+                check=True, capture_output=True, text=True,
+                env={**os.environ, "LC_ALL": "C"},
             )
-        with open(filepath, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        lines.sort(key=lambda s: s.encode("utf-8"))
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.writelines(lines)
+            return
+        except (subprocess.CalledProcessError, RuntimeError):
+            pass  # fall through to the in-memory fallback
+    if os.path.getsize(filepath) > FALLBACK_SORT_MAX_BYTES:
+        raise RuntimeError(
+            f"Cannot sort {filepath}: no usable system 'sort' and file "
+            f"exceeds the {FALLBACK_SORT_MAX_BYTES // 1024 // 1024} MB "
+            f"in-memory fallback limit. Install GNU coreutils "
+            f"(or run on Linux/macOS)."
+        )
+    with open(filepath, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    lines.sort(key=lambda s: s.encode("utf-8"))
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.writelines(lines)
 
 
 # ---- Merge ----

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dict-build"
-version = "1.4.0"
+version = "1.4.1"
 description = "Statistical Chinese new word discovery from raw text"
 authors = [{ name = "wainshine" }]
 license = "Apache-2.0"

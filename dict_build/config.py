@@ -45,6 +45,8 @@ INTERMEDIATE_SIZE_FACTOR = 8
 SINGLE_LINE_MIN_BYTES = 100 * 1024 * 1024
 SINGLE_LINE_MAX_NEWLINES = 10
 SINGLE_LINE_SAMPLE_BYTES = 4 * 1024 * 1024
+# Max chars held as boundary carry in single-line mode before flushing
+SINGLE_LINE_PENDING_MAX_CHARS = 65536
 
 # Encoding detection: per-sample size and CJK ratio heuristics
 ENCODING_SAMPLE_BYTES = 64 * 1024
