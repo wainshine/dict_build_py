@@ -6,6 +6,6 @@ try:
     __version__ = version("dict-build")
 except Exception:
     # Package not installed (running from source tree)
-    __version__ = "1.3.0"
+    __version__ = "1.4.0"
 
 __author__ = "wainshine"

@@ -85,7 +85,7 @@ def compute_pmi(
 
 
 def extract_words(
-    merged_data: list[tuple[str, int, float]],
+    merged_data,  # iterable of (word, freq, entropy), consumed once
     pos_prob: dict[str, tuple[float, float, float]],
     trie: marisa_trie.RecordTrie,
     total_single: int,

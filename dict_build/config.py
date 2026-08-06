@@ -29,12 +29,12 @@ BUCKET_TARGET_BYTES = 4 * 1024 * 1024 * 1024     # 4 GB per bucket
 MIN_SORT_MEM_MB = 512                              # minimum MB per sort process
 MAX_BUCKETS = 64        # cap: distribution opens 2 x num_buckets handles per batch
 BUCKET_DISTRIBUTE_BATCH = 15   # temp files per distribution batch
-BUCKET_BUF_MIN_BYTES = 128 * 1024 * 1024   # per-bucket buffer floor
+BUCKET_BUF_MIN_BYTES = 8 * 1024 * 1024     # per-bucket buffer floor
 BUCKET_BUF_MAX_BYTES = 256 * 1024 * 1024   # per-bucket buffer cap
 
 # Sorted n-gram files larger than this get split for parallel entropy
 PARALLEL_ENTROPY_MIN_BYTES = 1 * 1024 * 1024 * 1024  # 1 GB
-ENTROPY_SPLIT_CHARS_PER_FILE = 10
+ENTROPY_SPLIT_MIN_BYTES = 32 * 1024 * 1024  # smallest chunk for parallel split
 
 # Estimated n-gram intermediate size as a multiple of input size
 # (forward + backward n-grams, sorted copies, entropy files)

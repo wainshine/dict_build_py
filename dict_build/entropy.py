@@ -152,12 +152,12 @@ def sort_file_inplace(filepath: str) -> None:
 
 # ---- Merge ----
 
-def merge_entropy_files_sorted(
+def iter_merge_entropy_files_sorted(
     right_file: str,
     left_file: str,
     min_entropy: float = -1.0,
-) -> list[tuple[str, int, float]]:
-    """Merge sorted right and left entropy files, taking min(entropy).
+) -> Iterator[tuple[str, int, float]]:
+    """Stream the merge of sorted right and left entropy files.
 
     Both files must be sorted by word. The merge compares Python str
     directly: this is correct because all entropy files are UTF-8 and
@@ -166,16 +166,15 @@ def merge_entropy_files_sorted(
     """
     r_iter = read_entropy_from_file(right_file)
     l_iter = read_entropy_from_file(left_file)
-    result: list[tuple[str, int, float]] = []
 
     try:
         r = next(r_iter)
     except StopIteration:
-        return result
+        return
     try:
         l = next(l_iter)
     except StopIteration:
-        return result
+        return
 
     while True:
         rw, rf, re = r
@@ -184,7 +183,7 @@ def merge_entropy_files_sorted(
         if rw == lw:
             merged = min(re, le)
             if merged >= min_entropy:
-                result.append((rw, rf, merged))
+                yield (rw, rf, merged)
             try:
                 r = next(r_iter)
             except StopIteration:
@@ -203,4 +202,17 @@ def merge_entropy_files_sorted(
                 l = next(l_iter)
             except StopIteration:
                 break
-    return result
+
+
+def merge_entropy_files_sorted(
+    right_file: str,
+    left_file: str,
+    min_entropy: float = -1.0,
+) -> list[tuple[str, int, float]]:
+    """Merge sorted right and left entropy files, taking min(entropy).
+
+    Materializes the full list; large pipelines should prefer
+    iter_merge_entropy_files_sorted.
+    """
+    return list(iter_merge_entropy_files_sorted(
+        right_file, left_file, min_entropy))

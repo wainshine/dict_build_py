@@ -1,6 +1,6 @@
 # dict_build_py
 
-版本 1.3.0 | 作者 wainshine | 协议 Apache-2.0
+版本 1.4.0 | 作者 wainshine | 协议 Apache-2.0
 
 从原始文本中自动发现中文新词，构建领域/行业专属词典。
 
@@ -16,6 +16,8 @@ pip install -e .
 ```
 
 依赖：Python 3.10+、`marisa-trie`、`tqdm`、`click`、`jieba`、`regex`、`charset-normalizer`。
+
+平台支持：Linux / macOS 完整支持（依赖系统 `sort` 命令，启动时自动探测 GNU/BSD 能力）；Windows 为实验性——需自行提供 GNU coreutils `sort`（如通过 Git Bash / MSYS2 / WSL），否则大文件排序阶段会明确报错退出。
 
 ## 用法
 
@@ -213,7 +215,7 @@ dict_build_py/
 │   ├── pipeline.py       # 流程编排 + 编码检测 + 哈希分桶排序
 │   └── data/pos_prop.txt # 位置成词概率
 └── tests/
-    └── test_extract.py   # 70 个单元测试
+    └── test_extract.py   # 75 个单元测试
 ```
 
 ## 与 dict_build (Java) 版本的差异
@@ -238,6 +240,7 @@ dict_build_py/
 
 | 版本 | 主要变更 |
 |------|---------|
+| 1.4.0 | 分桶右熵 k-way merge（省一趟全量 sort）、桶分发多进程分片（2→workers 进程，实测 1.7×）、merge 阶段全流式、熵并行切分按字节均衡（消除热首字倾斜）、分桶路径端到端 + 续跑测试、CLI 参数范围校验、GitHub Actions CI（Linux/macOS/Windows）、测试 70→75 |
 | 1.3.0 | 断点续跑（--work-dir/--force）、logging + --verbose/--quiet、磁盘预检 + --temp-dir（sort -T 同步生效）、熵计算 O(1) 流式化、sort 能力探测 + 双排序内存均分、编码检测三采样、单行模式跨段词召回修复、混合输入丢数据等 P0 修复、阈值改显式传参、测试 57→70 |
 | 1.2.0 | 哈希分桶排序（300GB n-gram 2h→20min）、编码检测 v5 重写、编码杂质过滤、测试 38→57 |
 | 1.1.0 | 熵计算并行化、GBK/GB18030 自动检测、worker 直写 temp 文件、背压限流 |

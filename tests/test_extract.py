@@ -377,7 +377,7 @@ def test_sort_bucket():
         path = os.path.join(tmp, "unsorted.txt")
         with open(path, "w") as f:
             f.write("c\t1\nb\t2\na\t3\n")
-        sorted_path = _sort_bucket(path, sort_mem_mb=256)
+        sorted_path = _sort_bucket([path], sort_mem_mb=256)
         with open(sorted_path) as f:
             lines = f.readlines()
         assert lines[0].startswith("a")
@@ -810,8 +810,8 @@ def test_pipeline_resume_after_failure(monkeypatch):
         run_pipeline(corpus, output_path=out1, **kw)
 
         # Second run: crash at the merge stage
-        real_merge = pl.merge_entropy_files_sorted
-        monkeypatch.setattr(pl, "merge_entropy_files_sorted",
+        real_merge = pl.iter_merge_entropy_files_sorted
+        monkeypatch.setattr(pl, "iter_merge_entropy_files_sorted",
                             lambda *a, **k: (_ for _ in ()).throw(
                                 RuntimeError("simulated crash")))
         try:
@@ -820,7 +820,7 @@ def test_pipeline_resume_after_failure(monkeypatch):
         except RuntimeError:
             pass
         assert os.path.exists(os.path.join(work, ".entropy.done"))
-        monkeypatch.setattr(pl, "merge_entropy_files_sorted", real_merge)
+        monkeypatch.setattr(pl, "iter_merge_entropy_files_sorted", real_merge)
 
         # Third run: resumes from checkpoint, same output as clean run
         run_pipeline(corpus, output_path=out2, work_dir=work, **kw)
@@ -928,3 +928,108 @@ def test_single_line_chunk_boundary_no_loss(monkeypatch):
             ref.extend(ng + "\n" for ng in
                        pl.generate_ngrams(sent, 4))
         assert chunked == sorted(ref)
+
+
+# ============================================================
+# bucket path (forced via tiny thresholds)
+# ============================================================
+
+_BUCKET_KW = dict(max_len=4, mem_mb=256, workers=2, min_freq=5,
+                  entropy_threshold=0.0, pmi_threshold=0.0,
+                  pos_threshold=0.0)
+
+
+def _force_buckets(monkeypatch):
+    import dict_build.pipeline as pl
+    monkeypatch.setattr(pl, "BUCKET_SORT_MIN_BYTES", 1)
+    monkeypatch.setattr(pl, "BUCKET_TARGET_BYTES", 4096)
+
+
+@requires_sort
+def test_pipeline_bucket_path_e2e(monkeypatch):
+    """Force the hash-bucket sort path on a small corpus."""
+    _force_buckets(monkeypatch)
+    with tempfile.TemporaryDirectory() as tmp:
+        corpus = _make_text_file(tmp, "b.txt",
+            ("天下太平万物安宁\n天地玄黄宇宙洪荒\n"
+             "日月盈昃辰宿列张\n寒来暑往秋收冬藏\n") * 60)
+        out = run_pipeline(corpus, **_BUCKET_KW)
+        with open(out) as f:
+            content = f.read()
+        assert "天下" in content
+        assert "天地" in content
+
+
+@requires_sort
+def test_pipeline_bucket_resume(monkeypatch):
+    """Bucket path: crash at entropy stage resumes via buckets manifest."""
+    import dict_build.pipeline as pl
+    _force_buckets(monkeypatch)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        corpus = _make_text_file(tmp, "b.txt",
+            ("天下太平万物安宁\n天地玄黄宇宙洪荒\n"
+             "日月盈昃辰宿列张\n寒来暑往秋收冬藏\n") * 60)
+        work = os.path.join(tmp, "work")
+        out1 = os.path.join(tmp, "o1.data")
+        out2 = os.path.join(tmp, "o2.data")
+
+        run_pipeline(corpus, output_path=out1, **_BUCKET_KW)
+
+        real = pl._compute_entropy_from_sorted_list
+        monkeypatch.setattr(pl, "_compute_entropy_from_sorted_list",
+                            lambda *a, **k: (_ for _ in ()).throw(
+                                RuntimeError("simulated crash")))
+        try:
+            run_pipeline(corpus, output_path=out2, work_dir=work,
+                         **_BUCKET_KW)
+            raise AssertionError("expected crash")
+        except RuntimeError:
+            pass
+        assert os.path.exists(os.path.join(work, ".sorted.done"))
+        monkeypatch.setattr(pl, "_compute_entropy_from_sorted_list", real)
+
+        run_pipeline(corpus, output_path=out2, work_dir=work, **_BUCKET_KW)
+        with open(out1) as f1, open(out2) as f2:
+            assert f1.read() == f2.read()
+
+
+def test_merge_sorted_entropy_files():
+    """K-way merge of per-bucket entropy files yields global order."""
+    from dict_build.pipeline import _merge_sorted_entropy_files
+
+    with tempfile.TemporaryDirectory() as tmp:
+        p1 = _make_entropy_file(tmp, "b0.txt",
+                                [("世界", 5, 3.0), ("天地", 9, 2.5)])
+        p2 = _make_entropy_file(tmp, "b1.txt",
+                                [("天下", 7, 4.0), ("安宁", 3, 1.5)])
+        out = os.path.join(tmp, "merged.txt")
+        _merge_sorted_entropy_files([p1, p2], out)
+        rows = list(read_entropy_from_file(out))
+        assert [w for w, _, _ in rows] == sorted(
+            [w for w, _, _ in rows], key=lambda s: s.encode("utf-8"))
+        assert {w for w, _, _ in rows} == {"世界", "天地", "天下", "安宁"}
+
+
+def test_decode_utf8_tolerant():
+    from dict_build.pipeline import _decode_utf8_tolerant
+
+    # clean ASCII
+    assert _decode_utf8_tolerant(b"abc") == "abc"
+    # trailing split multi-byte char tolerated
+    assert _decode_utf8_tolerant("天".encode() + "下".encode()[:2]) == "天"
+    # mid-sample corruption still raises
+    bad = b"good" + b"\xff\xfe" + b"tail"
+    try:
+        _decode_utf8_tolerant(bad)
+        raise AssertionError("expected UnicodeDecodeError")
+    except UnicodeDecodeError:
+        pass
+
+
+def test_cli_rejects_bad_mem():
+    from click.testing import CliRunner
+    from dict_build.__main__ import main
+
+    result = CliRunner().invoke(main, ["--mem", "0", "x.txt"])
+    assert result.exit_code != 0

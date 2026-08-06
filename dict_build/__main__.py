@@ -23,12 +23,16 @@ from .pipeline import run_pipeline
 @click.option("--output", "-o", default=None,
               help="Output file path (auto-generated if omitted).")
 @click.option("--max-len", "-l", default=DEFAULT_MAX_LEN,
+              type=click.IntRange(2, 32),
               help="Maximum word length for n-gram generation.")
 @click.option("--mem", "-m", default=DEFAULT_MEM_MB,
+              type=click.IntRange(1),
               help="Memory budget in MB for external sort.")
 @click.option("--workers", "-w", default=WORKERS,
+              type=click.IntRange(1),
               help="Number of worker processes.")
 @click.option("--min-freq", default=MIN_FREQ,
+              type=click.IntRange(1),
               help="Minimum frequency for trie inclusion.")
 @click.option("--pos-prop", default=None,
               help="Path to pos_prop.txt.")

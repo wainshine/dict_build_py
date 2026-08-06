@@ -7,6 +7,8 @@ Handles:
 """
 
 import io
+import heapq
+import itertools
 import json
 import logging
 import os
@@ -28,7 +30,7 @@ from .config import (
     MAX_BUCKETS, INTERMEDIATE_SIZE_FACTOR,
     PENDING_TASK_FACTOR, NGRAM_WRITE_BATCH, AVG_LINE_BYTES,
     BUCKET_DISTRIBUTE_BATCH, BUCKET_BUF_MIN_BYTES, BUCKET_BUF_MAX_BYTES,
-    PARALLEL_ENTROPY_MIN_BYTES, ENTROPY_SPLIT_CHARS_PER_FILE,
+    PARALLEL_ENTROPY_MIN_BYTES, ENTROPY_SPLIT_MIN_BYTES,
     SINGLE_LINE_MIN_BYTES, SINGLE_LINE_MAX_NEWLINES,
     SINGLE_LINE_SAMPLE_BYTES,
     ENCODING_SAMPLE_BYTES, CJK_RATIO_UTF8_MIN, CJK_RATIO_WINNER_MIN,
@@ -40,7 +42,7 @@ from .entropy import (
     compute_entropy_from_sorted_left,
     write_entropy_to_file,
     sort_file_inplace,
-    merge_entropy_files_sorted,
+    iter_merge_entropy_files_sorted,
     read_entropy_from_file,
 )
 from .pmi import build_and_mmap_trie, extract_words
@@ -229,20 +231,24 @@ def _calc_bucket_params(
     return num, max_concurrent, sort_mem_per
 
 
-def _sort_bucket(path: str, sort_mem_mb: int) -> str:
-    """Sort a single bucket file, return path to sorted result."""
-    out = path + ".sorted"
+def _sort_bucket(paths: list[str], sort_mem_mb: int) -> str:
+    """Sort one bucket (one or more shard files), return sorted path."""
+    out = paths[0] + ".sorted"
     env = {**os.environ, "LC_ALL": "C"}
     result = subprocess.run(
-        [*_sort_command(sort_mem_mb, 1, os.path.dirname(path)),
-         "-o", out, path],
+        [*_sort_command(sort_mem_mb, 1, os.path.dirname(paths[0])),
+         "-o", out, *paths],
         capture_output=True, text=True, env=env,
     )
     if result.returncode != 0:
         raise RuntimeError(
             f"Bucket sort failed (rc={result.returncode}): {result.stderr.strip()}"
         )
-    os.remove(path)
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
     return out
 
 
@@ -252,13 +258,19 @@ def _distribute_batches(
     num_buckets: int,
     buf_limit: int,
     batch_size: int,
+    shard: str = "",
 ) -> None:
-    """Process a list of temp files in batches into bucket files."""
+    """Process a list of temp files in batches into bucket files.
+
+    Bucket files are named {fw|bw}{shard}_b{NNNN}.txt so multiple
+    distribution processes can write disjoint shard sets concurrently.
+    """
+    crc32 = zlib.crc32
     for batch_start in range(0, len(paths), batch_size):
         batch = paths[batch_start:batch_start + batch_size]
-        fw_bh = [open(os.path.join(bucket_dir, f"fw_b{i:04d}.txt"), "ab")
+        fw_bh = [open(os.path.join(bucket_dir, f"fw{shard}_b{i:04d}.txt"), "ab")
                  for i in range(num_buckets)]
-        bw_bh = [open(os.path.join(bucket_dir, f"bw_b{i:04d}.txt"), "ab")
+        bw_bh = [open(os.path.join(bucket_dir, f"bw{shard}_b{i:04d}.txt"), "ab")
                  for i in range(num_buckets)]
         fw_bufs = [io.BytesIO() for _ in range(num_buckets)]
         bw_bufs = [io.BytesIO() for _ in range(num_buckets)]
@@ -268,6 +280,8 @@ def _distribute_batches(
             is_fw = os.path.basename(tp).startswith("fw_")
             buckets = fw_bh if is_fw else bw_bh
             bufs = fw_bufs if is_fw else bw_bufs
+            writes = [b.write for b in bufs]
+            tells = [b.tell for b in bufs]
 
             with open(tp, "rb") as src:
                 while True:
@@ -275,24 +289,26 @@ def _distribute_batches(
                     if not chunk:
                         break
                     chunk = carry + chunk
-                    carry = b""
                     lines = chunk.split(b"\n")
-                    for i in range(len(lines) - 1):
-                        line = lines[i]
+                    carry = lines.pop()
+                    for line in lines:
                         if not line or line == b"\r":
                             continue
-                        h = _hash_line(line) % num_buckets
-                        bufs[h].write(line)
-                        bufs[h].write(b"\n")
-                        if bufs[h].tell() >= buf_limit:
+                        tab = line.find(b"\t")
+                        key = line[:tab] if tab > 0 else line
+                        h = (crc32(key) & 0x7FFFFFFF) % num_buckets
+                        writes[h](line)
+                        writes[h](b"\n")
+                        if tells[h]() >= buf_limit:
                             buckets[h].write(bufs[h].getvalue())
                             bufs[h].seek(0)
                             bufs[h].truncate()
-                    carry = lines[-1]
                 if carry and carry != b"\r":
-                    h = _hash_line(carry) % num_buckets
-                    bufs[h].write(carry)
-                    bufs[h].write(b"\n")
+                    tab = carry.find(b"\t")
+                    key = carry[:tab] if tab > 0 else carry
+                    h = (crc32(key) & 0x7FFFFFFF) % num_buckets
+                    writes[h](carry)
+                    writes[h](b"\n")
             os.remove(tp)
 
         for side_bufs, side_bh in [(fw_bufs, fw_bh), (bw_bufs, bw_bh)]:
@@ -304,6 +320,12 @@ def _distribute_batches(
                 bh.close()
 
 
+def _shard_list(paths: list[str], n: int) -> list[list[str]]:
+    """Split paths into n round-robin shards (temp files are ~equal size)."""
+    n = max(1, min(n, len(paths)))
+    return [paths[i::n] for i in range(n)]
+
+
 def _distribute_and_sort_ngrams(
     temp_dir: str,
     fw_tmp_paths: list[str],
@@ -312,56 +334,75 @@ def _distribute_and_sort_ngrams(
     max_concurrent: int,
     sort_mem_mb: int,
     mem_mb: int,
+    workers: int = 2,
 ) -> tuple[list[str], list[str]]:
     """Partition n-gram temp files into hash buckets, sort each bucket.
 
-    Processes temp files in batches (avoiding open-file thrash on 153+
-    file handles). fw and bw streams run in parallel via two processes.
-    Buffer size per bucket adapts to available memory.
+    Distribution runs in up to `workers` processes (fw/bw sharded),
+    each writing disjoint shard files; a bucket's shards are sorted
+    together (sort natively merges multiple inputs). Buffer memory
+    across all distribution processes stays within mem_mb / 2.
     """
     bucket_dir = tempfile.mkdtemp(prefix="dict_build_buckets_",
                                    dir=temp_dir)
 
-    # Adaptive per-bucket buffer: 1/4 of mem, split across buckets,
-    # floor/cap from config.
+    num_dist = max(2, workers)
+    fw_shards = _shard_list(fw_tmp_paths,
+                            max(1, min(len(fw_tmp_paths), num_dist // 2)))
+    bw_shards = _shard_list(bw_tmp_paths,
+                            max(1, min(len(bw_tmp_paths),
+                                       num_dist - len(fw_shards))))
+    num_procs = len(fw_shards) + len(bw_shards)
+
+    # Adaptive per-bucket buffer: half of mem across all distribution
+    # processes, split across buckets, floor/cap from config.
     mem_bytes = mem_mb * 1024 * 1024
     buf_limit = max(BUCKET_BUF_MIN_BYTES,
                     min(BUCKET_BUF_MAX_BYTES,
-                        (mem_bytes // 4) // max(num_buckets, 1)))
+                        (mem_bytes // 2) // num_procs // max(num_buckets, 1)))
 
-    # Two processes (no GIL) process fw and bw simultaneously
     from multiprocessing import Process
-    fw_proc = Process(target=_distribute_batches,
-                      args=(fw_tmp_paths, bucket_dir, num_buckets,
-                            buf_limit, BUCKET_DISTRIBUTE_BATCH))
-    bw_proc = Process(target=_distribute_batches,
-                      args=(bw_tmp_paths, bucket_dir, num_buckets,
-                            buf_limit, BUCKET_DISTRIBUTE_BATCH))
-    fw_proc.start()
-    bw_proc.start()
-    fw_proc.join()
-    bw_proc.join()
+    procs: list[tuple[str, Process]] = []
+    for idx, shard_paths in enumerate(fw_shards):
+        procs.append(("Forward", Process(
+            target=_distribute_batches,
+            args=(shard_paths, bucket_dir, num_buckets, buf_limit,
+                  BUCKET_DISTRIBUTE_BATCH, f"_s{idx}"))))
+    for idx, shard_paths in enumerate(bw_shards):
+        procs.append(("Backward", Process(
+            target=_distribute_batches,
+            args=(shard_paths, bucket_dir, num_buckets, buf_limit,
+                  BUCKET_DISTRIBUTE_BATCH, f"_s{idx}"))))
+    for _, p in procs:
+        p.start()
+    for _, p in procs:
+        p.join()
+    for side, p in procs:
+        if p.exitcode != 0:
+            raise RuntimeError(
+                f"{side} distribution failed (exit {p.exitcode})")
 
-    if fw_proc.exitcode != 0:
-        raise RuntimeError(f"Forward distribution failed (exit {fw_proc.exitcode})")
-    if bw_proc.exitcode != 0:
-        raise RuntimeError(f"Backward distribution failed (exit {bw_proc.exitcode})")
-
-    # Collect bucket file paths
-    fw_bucket_paths = [os.path.join(bucket_dir, f"fw_b{i:04d}.txt")
-                       for i in range(num_buckets)]
-    bw_bucket_paths = [os.path.join(bucket_dir, f"bw_b{i:04d}.txt")
-                       for i in range(num_buckets)]
+    # Bucket i's inputs = its shard files from every distribution process
+    fw_bucket_inputs = [
+        [os.path.join(bucket_dir, f"fw_s{s}_b{i:04d}.txt")
+         for s in range(len(fw_shards))]
+        for i in range(num_buckets)
+    ]
+    bw_bucket_inputs = [
+        [os.path.join(bucket_dir, f"bw_s{s}_b{i:04d}.txt")
+         for s in range(len(bw_shards))]
+        for i in range(num_buckets)
+    ]
 
     # Sort each bucket (parallel)
     fw_sorted: list[str] = []
     bw_sorted: list[str] = []
-    all_buckets = fw_bucket_paths + bw_bucket_paths
-    is_fw = [True] * len(fw_bucket_paths) + [False] * len(bw_bucket_paths)
+    all_buckets = fw_bucket_inputs + bw_bucket_inputs
+    is_fw = [True] * len(fw_bucket_inputs) + [False] * len(bw_bucket_inputs)
 
     with Pool(processes=max_concurrent) as pool:
-        futs = [pool.apply_async(_sort_bucket, (bp, sort_mem_mb))
-                for bp in all_buckets]
+        futs = [pool.apply_async(_sort_bucket, (bps, sort_mem_mb))
+                for bps in all_buckets]
         for fut, fw_flag in zip(futs, is_fw):
             sp = fut.get()
             if fw_flag:
@@ -629,7 +670,6 @@ def run_pipeline(
     bw_tmp_paths: list[str] = []
     fw_sorted: list[str] = []
     bw_sorted: list[str] = []
-    merged: list[tuple[str, int, float]] | None = None
 
     if checkpointing:
         meta = _ckpt_read_meta(run_dir) or {}
@@ -728,7 +768,7 @@ def run_pipeline(
                 _ckpt_unmark(run_dir, "ngrams")
                 fw_sorted, bw_sorted = _distribute_and_sort_ngrams(
                     run_dir, fw_tmp_paths, bw_tmp_paths,
-                    num_buckets, max_conc, sort_mem, mem_mb,
+                    num_buckets, max_conc, sort_mem, mem_mb, workers,
                 )
                 if checkpointing:
                     _write_buckets_manifest(run_dir, fw_sorted, bw_sorted)
@@ -790,8 +830,7 @@ def run_pipeline(
                     fw_sorted, right_entropy_file, min_freq, direct=True,
                     workers=workers,
                 )
-                # Per-bucket results are only group-sorted; re-sort for merge
-                sort_file_inplace(right_entropy_file)
+                # k-way merged per-bucket output is already globally sorted
             elif os.path.getsize(ngram_fw_sorted) > PARALLEL_ENTROPY_MIN_BYTES:
                 r_count = _write_entropy_from_ngram_parallel(
                     ngram_fw_sorted, right_entropy_file, min_freq,
@@ -831,28 +870,28 @@ def run_pipeline(
 
         if stage == 4:
             logger.info("Stage 5: Merging left and right entropy...")
-            merged = merge_entropy_files_sorted(
-                right_entropy_file, left_entropy_file,
-                min_entropy=entropy_threshold,
-            )
+            merged_count = 0
+            with open(merged_file, "w", encoding="utf-8") as mf:
+                for word, freq, ent in iter_merge_entropy_files_sorted(
+                        right_entropy_file, left_entropy_file,
+                        min_entropy=entropy_threshold):
+                    mf.write(f"{word}\t{freq}\t{ent:.6f}\n")
+                    merged_count += 1
             logger.info("  Merged: %d candidates (entropy >= %s)",
-                        len(merged), entropy_threshold)
+                        merged_count, entropy_threshold)
             if checkpointing:
-                write_entropy_to_file(iter(merged), merged_file)
                 _ckpt_mark(run_dir, "merged")
             stage = 5
 
         if stage == 5:
-            if merged is None:
-                merged = list(read_entropy_from_file(merged_file))
-                logger.info("Stage 5: Loaded %d merged candidates "
-                            "from checkpoint", len(merged))
-
-            if not merged:
+            merged_iter = read_entropy_from_file(merged_file)
+            first = next(merged_iter, None)
+            if first is None:
                 logger.info("  No candidates pass entropy threshold.")
                 _write_output([], output_path)
                 success = True
                 return output_path
+            merged_iter = itertools.chain([first], merged_iter)
 
             logger.info("Stage 6a: Building frequency trie "
                         "(stream from file)...")
@@ -865,7 +904,7 @@ def run_pipeline(
             logger.info("Stage 6b: Computing PMI and filtering...")
             pos_prob = load_pos_prob(pos_prob_path)
             results_raw = extract_words(
-                merged, pos_prob, trie, total_single,
+                merged_iter, pos_prob, trie, total_single,
                 pmi_threshold=pmi_threshold,
                 pos_threshold=pos_threshold,
             )
@@ -1140,16 +1179,18 @@ def _process_text_with_carry(
 def _split_sorted_ngram_by_chars(
     ngram_file: str,
     output_dir: str,
-    chars_per_file: int = ENTROPY_SPLIT_CHARS_PER_FILE,
+    target_chars: int,
 ) -> list[str]:
     """Split sorted n-gram file at first-character boundaries.
 
-    The n-gram file is sorted lexically (by word). Splitting at a character
-    boundary is safe — all lines for a given first character stay together.
+    Splitting at a character boundary is safe — all lines for a given
+    first character stay together. A new chunk starts once the current
+    one reaches target_chars, so hot first characters no longer produce
+    oversized chunks (byte-balanced instead of count-balanced).
     """
     split_paths: list[str] = []
     current_fh = None
-    chars_since_split = 0
+    chars_in_current = 0
     prev_char = ""
     chunk_idx = 0
 
@@ -1161,17 +1202,17 @@ def _split_sorted_ngram_by_chars(
             first = line[0]
             if first != prev_char:
                 prev_char = first
-                chars_since_split += 1
-                if current_fh is None or chars_since_split > chars_per_file:
+                if current_fh is None or chars_in_current >= target_chars:
                     if current_fh:
                         current_fh.close()
                     path = os.path.join(output_dir, f"chunk_{chunk_idx:05d}.txt")
                     split_paths.append(path)
                     current_fh = open(path, "w", encoding="utf-8")
                     chunk_idx += 1
-                    chars_since_split = 1
+                    chars_in_current = 0
             if current_fh:
                 current_fh.write(line)
+                chars_in_current += len(line)
     if current_fh:
         current_fh.close()
     return split_paths
@@ -1198,14 +1239,18 @@ def _write_entropy_from_ngram_parallel(
     min_freq: int,
     direct: bool,
     workers: int,
-    chars_per_file: int = ENTROPY_SPLIT_CHARS_PER_FILE,
 ) -> int:
-    """Split n-gram file by first-char groups, compute entropy in parallel."""
+    """Split n-gram file at char boundaries (~3 chunks per worker, byte
+    balanced), compute entropy in parallel."""
     split_dir = tempfile.mkdtemp(prefix="dict_build_entropy_",
                                  dir=os.path.dirname(output_file))
     try:
+        size = os.path.getsize(ngram_file)
+        # chars ≈ bytes / 3 for CJK-heavy UTF-8 content
+        target_chars = max(ENTROPY_SPLIT_MIN_BYTES // 3,
+                           size // 3 // max(1, workers * 3))
         split_paths = _split_sorted_ngram_by_chars(
-            ngram_file, split_dir, chars_per_file,
+            ngram_file, split_dir, target_chars,
         )
         logger.info("    Split into %d first-char chunks", len(split_paths))
 
@@ -1272,8 +1317,15 @@ def _compute_entropy_from_sorted_list(
     direct: bool,
     workers: int,
 ) -> int:
-    """Compute entropy on each sorted bucket, concat results, return total."""
+    """Compute entropy on each sorted bucket, combine, return total.
+
+    direct=True (right entropy): each bucket's output is sorted by word,
+    so results are combined with a k-way merge — no full re-sort needed.
+    direct=False (left entropy): words are reversed after computation,
+    breaking order, so results are concatenated and sorted later.
+    """
     total = 0
+    tmp_paths: list[str] = []
     with Pool(processes=min(workers, len(sorted_paths))) as pool:
         desc = "    Entropy" if direct else "    Entropy(L)"
         pbar = tqdm.tqdm(total=len(sorted_paths), desc=desc, unit="file")
@@ -1281,20 +1333,45 @@ def _compute_entropy_from_sorted_list(
             pool.apply_async(_process_entropy_split, (sp, min_freq, direct))
             for sp in sorted_paths
         ]
-        with open(output_file, "w", encoding="utf-8") as out:
-            for fut in futs:
-                try:
-                    count, tmp_path = fut.get()
-                except Exception:
-                    pool.terminate()
-                    raise
-                total += count
-                with open(tmp_path, "r", encoding="utf-8") as f:
-                    shutil.copyfileobj(f, out)
-                os.remove(tmp_path)
-                pbar.update(1)
+        for fut in futs:
+            try:
+                count, tmp_path = fut.get()
+            except Exception:
+                pool.terminate()
+                raise
+            total += count
+            tmp_paths.append(tmp_path)
+            pbar.update(1)
         pbar.close()
+
+    try:
+        if direct:
+            _merge_sorted_entropy_files(tmp_paths, output_file)
+        else:
+            with open(output_file, "w", encoding="utf-8") as out:
+                for tp in tmp_paths:
+                    with open(tp, "r", encoding="utf-8") as f:
+                        shutil.copyfileobj(f, out)
+    finally:
+        for tp in tmp_paths:
+            try:
+                os.remove(tp)
+            except OSError:
+                pass
     return total
+
+
+def _merge_sorted_entropy_files(paths: list[str], output_file: str) -> None:
+    """K-way merge of per-bucket entropy files (each sorted by word).
+
+    Words are unique across buckets (hash partition), and str comparison
+    matches the LC_ALL=C byte order because all files are UTF-8.
+    """
+    iterators = [read_entropy_from_file(p) for p in paths]
+    with open(output_file, "w", encoding="utf-8") as out:
+        for word, freq, entropy in heapq.merge(*iterators,
+                                               key=lambda t: t[0]):
+            out.write(f"{word}\t{freq}\t{entropy:.6f}\n")
 
 
 # ---- Output ----
