@@ -902,3 +902,29 @@ def test_cli_help():
     assert result.exit_code == 0
     for opt in ("--work-dir", "--force", "--temp-dir", "--verbose", "--quiet"):
         assert opt in result.output
+
+
+def test_single_line_chunk_boundary_no_loss(monkeypatch):
+    """Tokens spanning chunk boundaries are stitched, not lost."""
+    import dict_build.pipeline as pl
+    from dict_build.preprocess import preprocess_line
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # 10-char chunks cut through 8-char words constantly
+        monkeypatch.setattr(pl, "SINGLE_LINE_CHAR_CHUNK", 10)
+        monkeypatch.setattr(pl, "BYTE_BUF", 1 << 20)
+        content = "天地玄黄宇宙洪荒" * 30 + "。" + "日月盈昃辰宿列张" * 30
+        src = _make_text_file(tmp, "sl.txt", content)
+        fw = os.path.join(tmp, "fw.txt")
+        bw = os.path.join(tmp, "bw.txt")
+        pl._generate_ngrams_single_line(src, fw, bw, max_len=4)
+
+        with open(fw, encoding="utf-8") as f:
+            chunked = sorted(f.readlines())
+
+        # Reference: whole text processed without chunking
+        ref = []
+        for sent in preprocess_line(content):
+            ref.extend(ng + "\n" for ng in
+                       pl.generate_ngrams(sent, 4))
+        assert chunked == sorted(ref)

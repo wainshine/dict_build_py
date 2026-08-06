@@ -23,7 +23,7 @@ import tqdm
 from .config import (
     DEFAULT_MAX_LEN, DEFAULT_MEM_MB, WORKERS, MIN_FREQ,
     PMI_THRESHOLD, ENTROPY_THRESHOLD, POS_PROB_THRESHOLD,
-    CHUNK_LINES, CHUNKS_PER_BATCH, OUTPUT_FILE_SUFFIX,
+    CHUNK_LINES, CHUNKS_PER_BATCH, OUTPUT_FILE_SUFFIX, SENTINEL,
     BUCKET_SORT_MIN_BYTES, BUCKET_TARGET_BYTES, MIN_SORT_MEM_MB,
     MAX_BUCKETS, INTERMEDIATE_SIZE_FACTOR,
     PENDING_TASK_FACTOR, NGRAM_WRITE_BATCH, AVG_LINE_BYTES,
@@ -33,7 +33,7 @@ from .config import (
     SINGLE_LINE_SAMPLE_BYTES,
     ENCODING_SAMPLE_BYTES, CJK_RATIO_UTF8_MIN, CJK_RATIO_WINNER_MIN,
 )
-from .preprocess import preprocess_line
+from .preprocess import preprocess_line, iter_chinese_tokens
 from .ngram import generate_ngrams, generate_reverse_ngrams
 from .entropy import (
     compute_entropy_from_sorted,
@@ -56,12 +56,15 @@ BYTE_BUF = 8 * 1024 * 1024
 _SORT_CAPS: tuple[str, bool] | None = None
 
 
-def _sort_command(mem_mb: int, workers: int) -> list[str]:
+def _sort_command(mem_mb: int, workers: int,
+                  tmp_dir: str | None = None) -> list[str]:
     """Build a system sort command, probing capabilities once per process.
 
     GNU sort gets -S/--parallel; BSD sort gets plain flags (it accepts
     but ignores -S on some versions, and silently ignores invalid
     memsize units, so flags are only passed when the probe succeeds).
+    -T pins sort's own temp files to tmp_dir so --temp-dir/--work-dir
+    actually govern the sort stage (POSIX: supported by GNU and BSD).
     Raises RuntimeError when no sort executable is available.
     """
     global _SORT_CAPS
@@ -88,6 +91,8 @@ def _sort_command(mem_mb: int, workers: int) -> list[str]:
     cmd = [exe]
     if gnu:
         cmd += ["-S", f"{max(1, mem_mb)}M", f"--parallel={max(1, workers)}"]
+    if tmp_dir is not None:
+        cmd += ["-T", tmp_dir]
     return cmd
 
 
@@ -229,7 +234,8 @@ def _sort_bucket(path: str, sort_mem_mb: int) -> str:
     out = path + ".sorted"
     env = {**os.environ, "LC_ALL": "C"}
     result = subprocess.run(
-        [*_sort_command(sort_mem_mb, 1), "-o", out, path],
+        [*_sort_command(sort_mem_mb, 1, os.path.dirname(path)),
+         "-o", out, path],
         capture_output=True, text=True, env=env,
     )
     if result.returncode != 0:
@@ -567,6 +573,9 @@ def run_pipeline(
 
     checkpointing = work_dir is not None
     if checkpointing:
+        if temp_dir is not None:
+            logger.warning("--temp-dir is ignored when --work-dir is set; "
+                           "intermediate files go to the work directory.")
         os.makedirs(work_dir, exist_ok=True)
         run_dir = work_dir
         if force:
@@ -738,7 +747,11 @@ def run_pipeline(
         if stage == 2:
             logger.info("Stage 3: Sorting n-grams (LC_ALL=C for speed)...")
             sort_env = {**os.environ, "LC_ALL": "C"}
-            sort_cmd = _sort_command(mem_mb, workers)
+            # fw and bw sorts run concurrently: split the memory/thread
+            # budget so peak usage stays within --mem
+            sort_cmd = _sort_command(max(1, mem_mb // 2),
+                                     max(1, workers // 2),
+                                     run_dir)
             t0 = time.time()
             p1 = subprocess.Popen([
                 *sort_cmd, "-o", ngram_fw_sorted, ngram_fw_path,
@@ -1049,14 +1062,15 @@ def _generate_ngrams_single_line(
         pbar = tqdm.tqdm(total=total_chunks, desc="  S-line", unit="chunk")
 
         carryover = b""
+        pending = ""
         with open(filepath, "rb") as fin:
             while True:
                 data = fin.read(BYTE_BUF)
                 if not data:
                     if carryover:
-                        _process_text_segment(
+                        pending = _process_text_with_carry(
                             carryover.decode(encoding, errors="replace"),
-                            max_len, fw_out, bw_out
+                            max_len, fw_out, bw_out, pending,
                         )
                     break
 
@@ -1078,18 +1092,47 @@ def _generate_ngrams_single_line(
 
                 for i in range(0, len(text), SINGLE_LINE_CHAR_CHUNK):
                     sub = text[i:i + SINGLE_LINE_CHAR_CHUNK]
-                    _process_text_segment(sub, max_len, fw_out, bw_out)
+                    pending = _process_text_with_carry(
+                        sub, max_len, fw_out, bw_out, pending,
+                    )
                     pbar.update(1)
 
+        # trailing token held back at EOF
+        if len(pending) >= 2:
+            _write_ngrams_batched(iter([SENTINEL + pending + SENTINEL]),
+                                  max_len, fw_out, bw_out)
         pbar.close()
     finally:
         fw_out.close()
         bw_out.close()
 
 
-def _process_text_segment(text: str, max_len: int, fw_out, bw_out) -> None:
-    """Preprocess a text segment and write n-grams directly."""
-    _write_ngrams_batched(preprocess_line(text), max_len, fw_out, bw_out)
+def _process_text_with_carry(
+    text: str,
+    max_len: int,
+    fw_out,
+    bw_out,
+    pending: str,
+) -> str:
+    """Process one text chunk; return the trailing fragment to carry over.
+
+    A Chinese token reaching the chunk end is held back and prepended to
+    the next chunk, so words spanning chunk boundaries are not lost.
+    (Holding back an actually-complete token is harmless: it is re-emitted
+    identically when the next chunk starts with punctuation, or flushed
+    at EOF.)
+    """
+    text = pending + text
+    tokens = list(iter_chinese_tokens(text))
+    pending = ""
+    if tokens:
+        tok, _s, e = tokens[-1]
+        if e == len(text):
+            pending = tok
+            tokens.pop()
+    sents = (SENTINEL + t + SENTINEL for t, _, _ in tokens if len(t) >= 2)
+    _write_ngrams_batched(sents, max_len, fw_out, bw_out)
+    return pending
 
 
 # ---- Entropy helpers ----

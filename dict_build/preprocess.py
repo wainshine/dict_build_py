@@ -22,6 +22,18 @@ def preprocess_line(line: str) -> Iterator[str]:
             yield SENTINEL + token + SENTINEL
 
 
+def iter_chinese_tokens(text: str) -> Iterator[tuple[str, int, int]]:
+    """Yield (token, start, end) for each Chinese run after cleaning.
+
+    Offsets refer to the original text (cleaning replaces single chars
+    with single spaces, so positions are preserved). Used by the
+    single-line file mode to stitch tokens across chunk boundaries.
+    """
+    cleaned = _PUNCT_PATTERN.sub(" ", text)
+    for match in _CHINESE_RE.finditer(cleaned):
+        yield match.group(), match.start(), match.end()
+
+
 def is_chinese(char: str) -> bool:
     """Check if a single character is in the Chinese Unicode range."""
     return 0x4E00 <= ord(char) <= 0x9FA5
