@@ -60,7 +60,7 @@ python -m dict_build huge_corpus.txt \
 | `--entropy-threshold` | 2.0 | 熵阈值 |
 | `--pos-threshold` | 0.1 | 位置成词概率阈值 |
 | `--temp-dir` | 系统临时目录 | 中间文件父目录（也可用 TMPDIR 环境变量） |
-| `--work-dir` | 无 | 固定工作目录，启用断点续跑 |
+| `--work-dir` | 无 | 固定工作目录，启用断点续跑（与 `--temp-dir` 互斥：设置后 `--temp-dir` 被忽略，中间文件全部进 work 目录） |
 | `--force` | 关 | 忽略 `--work-dir` 中的断点，从头重跑 |
 | `--verbose, -v` | 关 | 调试级日志 |
 | `--quiet, -q` | 关 | 只输出错误和进度条 |
@@ -69,7 +69,7 @@ python -m dict_build huge_corpus.txt \
 
 格式：`.txt` `.csv` `.json` `.sql` `.md` `.html` `.htm`
 
-编码：UTF-8 / GBK / GB18030 / BIG5 自动检测（按文件逐个检测，头部/中部/尾部三处采样）。算法采用五步策略：UTF-8 严格解码优先 → CJK 比率启发式 → 多编码择优 → charset-normalizer 兜底。即使文件内部混有乱码字节、或 ASCII 头部配 GBK 正文（如数据库 dump），也能正确识别并恢复可读的中文部分。
+编码：UTF-8 / GBK / GB18030 / BIG5 自动检测（按文件逐个检测，头部/中部/尾部三处采样）。算法采用四步策略：UTF-8 严格解码优先 → CJK 比率启发式 → 多编码择优 → charset-normalizer 兜底。即使文件内部混有乱码字节、或 ASCII 头部配 GBK 正文（如数据库 dump），也能正确识别并恢复可读的中文部分。
 
 ### 自动适配
 
@@ -201,6 +201,8 @@ word	freq	pmi	entropy	pos_prob	pos
 dict_build_py/
 ├── pyproject.toml
 ├── LICENSE
+├── CHANGELOG.md          # 版本历史
+├── HANDOVER.md           # 会话交接（工作现场快照）
 ├── dict_build/
 │   ├── __init__.py
 │   ├── __main__.py       # CLI 入口
@@ -237,14 +239,29 @@ dict_build_py/
 
 ## 版本历史
 
-| 版本 | 主要变更 |
-|------|---------|
-| 1.4.1 | 单行模式 pending 上限冲刷（修无标点巨文件 O(n²)/OOM，P1）、编码检测采样边界容错、清理死代码、manifest 统一 UTF-8、work_dir 绝对化、sort_file_inplace 并入能力探测体系、测试 75→81 |
-| 1.4.0 | 分桶右熵 k-way merge（省一趟全量 sort）、桶分发多进程分片（2→workers 进程，实测 1.7×）、merge 阶段全流式、熵并行切分按字节均衡（消除热首字倾斜）、分桶路径端到端 + 续跑测试、CLI 参数范围校验、GitHub Actions CI（Linux/macOS/Windows）、测试 70→75 |
-| 1.3.0 | 断点续跑（--work-dir/--force）、logging + --verbose/--quiet、磁盘预检 + --temp-dir（sort -T 同步生效）、熵计算 O(1) 流式化、sort 能力探测 + 双排序内存均分、编码检测三采样、单行模式跨段词召回修复、混合输入丢数据等 P0 修复、阈值改显式传参、测试 57→70 |
-| 1.2.0 | 哈希分桶排序（300GB n-gram 2h→20min）、编码检测 v5 重写、编码杂质过滤、测试 38→57 |
-| 1.1.0 | 熵计算并行化、GBK/GB18030 自动检测、worker 直写 temp 文件、背压限流 |
-| 1.0.0 | 首版，多进程 N-gram、系统 sort 并行、词性标注、CLI 阈值修复 |
+见 [CHANGELOG.md](CHANGELOG.md)。
+
+## 开发与接手
+
+```bash
+pip install -e ".[dev]"      # 安装开发依赖（含 pytest）
+python -m pytest tests/ -q   # 运行测试（81 个）
+```
+
+CI：GitHub Actions（`.github/workflows/test.yml`），Linux / macOS / Windows × Python 3.10 / 3.12 / 3.13，push 到 main 或 PR 时触发。
+
+改动代码前必读的设计不变量：
+
+| 不变量 | 说明 |
+|--------|------|
+| 字节序 = 码点序 | 所有熵文件为 UTF-8，LC_ALL=C 字节排序与 Python str 比较一致；熵合并、分桶 k-way merge 均依赖此序，不得改用 locale 感知排序 |
+| Checkpoint 签名 | `input / files / max_len / min_freq / entropy_threshold` 任一变化即废弃全部断点；`pmi_threshold / pos_threshold` 只在最终阶段生效，可自由调整 |
+| 单行模式 pending 上限 | `SINGLE_LINE_PENDING_MAX_CHARS` 防止无标点巨文件 pending 无限增长（O(n²)/OOM），刷写会损失边界上下文但统计上可忽略 |
+| spawn 模式保护 | macOS/Windows 以库方式调用 `run_pipeline()` 必须加 `if __name__ == "__main__":` |
+| 分桶 fd 预算 | 桶数上限 64（`MAX_BUCKETS`），分发进程每批打开 2×桶数句柄，提高上限前需重估 fd 与内存预算 |
+| 熵计算流式 | `compute_entropy_from_sorted` 为 O(1) 内存流式，输入必须已排序；任何改动不得引入全量物化 |
+
+版本号规则：发布新版本时需同步更新 `pyproject.toml`、`dict_build/__init__.py`（fallback）、README 头部三处，并在 CHANGELOG.md 记录。
 
 ## 致谢
 
