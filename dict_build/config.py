@@ -52,6 +52,9 @@ SINGLE_LINE_PENDING_MAX_CHARS = 65536
 ENCODING_SAMPLE_BYTES = 64 * 1024
 CJK_RATIO_UTF8_MIN = 0.005   # recovered-CJK threshold to keep UTF-8
 CJK_RATIO_WINNER_MIN = 0.01  # clear-winner threshold for GBK-family
+# A real (damaged) UTF-8 file decodes with very few U+FFFD; a GBK-family
+# file masquerading as UTF-8 produces masses of them (BIG5 ~45%).
+FFFD_RATIO_UTF8_MAX = 0.05
 
 # In-memory sort fallback limit when no system sort exists
 FALLBACK_SORT_MAX_BYTES = 256 * 1024 * 1024

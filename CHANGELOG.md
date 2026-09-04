@@ -4,6 +4,14 @@
 
 > 发布新版本时，版本号需同步更新三处：`pyproject.toml`、`dict_build/__init__.py`（fallback）、`README.md` 头部，并在本文件追加条目。
 
+## [1.4.2]
+
+- 修复 BIG5 编码检测误判（P1）：BIG5 字节按 UTF-8+replace 解码会漏出约 2% 偶然 CJK，超过旧的 0.5% 阈值导致误判为 UTF-8；现增加 U+FFFD 比率约束（受损 UTF-8 的 FFFD 率 <1%，BIG5 伪装约 45%）
+- 顺带修复：严格 UTF-8 解码成功但文件已含 U+FFFD 时，不再落入 GBK 候选比较（避免被误判为 gb18030）
+- 新增 4 个测试：BIG5 检测、受损 UTF-8 检测、并行熵路径（`_write_entropy_from_ngram_parallel`）、extract_words 输出降序断言
+- 测试 81→85
+- 文档体系：版本历史迁至 CHANGELOG.md；新增 HANDOVER.md（会话交接）；README 新增「开发与接手」节（设计不变量、CI、测试说明），修正「五步→四步」措辞与 --work-dir 互斥说明
+
 ## [1.4.1]
 
 - 单行模式 pending 上限冲刷（修无标点巨文件 O(n²)/OOM，P1）

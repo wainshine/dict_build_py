@@ -1,6 +1,6 @@
 # dict_build_py
 
-版本 1.4.1 | 作者 wainshine | 协议 Apache-2.0
+版本 1.4.2 | 作者 wainshine | 协议 Apache-2.0
 
 从原始文本中自动发现中文新词，构建领域/行业专属词典。
 
@@ -216,7 +216,7 @@ dict_build_py/
 │   ├── pipeline.py       # 流程编排 + 编码检测 + 哈希分桶排序
 │   └── data/pos_prop.txt # 位置成词概率
 └── tests/
-    └── test_extract.py   # 81 个单元测试
+    └── test_extract.py   # 85 个单元测试
 ```
 
 ## 与 dict_build (Java) 版本的差异
@@ -245,7 +245,7 @@ dict_build_py/
 
 ```bash
 pip install -e ".[dev]"      # 安装开发依赖（含 pytest）
-python -m pytest tests/ -q   # 运行测试（81 个）
+python -m pytest tests/ -q   # 运行测试（85 个）
 ```
 
 CI：GitHub Actions（`.github/workflows/test.yml`），Linux / macOS / Windows × Python 3.10 / 3.12 / 3.13，push 到 main 或 PR 时触发。

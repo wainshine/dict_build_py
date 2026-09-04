@@ -34,6 +34,7 @@ from .config import (
     SINGLE_LINE_MIN_BYTES, SINGLE_LINE_MAX_NEWLINES,
     SINGLE_LINE_SAMPLE_BYTES, SINGLE_LINE_PENDING_MAX_CHARS,
     ENCODING_SAMPLE_BYTES, CJK_RATIO_UTF8_MIN, CJK_RATIO_WINNER_MIN,
+    FFFD_RATIO_UTF8_MAX,
 )
 from .preprocess import preprocess_line, iter_chinese_tokens
 from .ngram import generate_ngrams, generate_reverse_ngrams
@@ -96,32 +97,38 @@ def _detect_file_encoding(filepath: str) -> str:
     """Detect the encoding of a text file.
 
     Samples head/middle/tail so an ASCII header does not mask a GBK body.
-    Tries UTF-8 first (if clean, it's the real encoding). For ambiguous
-    files, compares the CJK character *ratio* (not absolute count) across
-    GB18030/GBK/BIG5. Falls back to charset_normalizer if inconclusive.
+    Tries UTF-8 first (if decodable, it's the real encoding). Damaged
+    UTF-8 is kept only when the U+FFFD ratio is low — this separates it
+    from GBK-family files, which produce masses of U+FFFD when decoded
+    as UTF-8. For ambiguous files, compares the CJK character *ratio*
+    (not absolute count) across GB18030/GBK/BIG5. Falls back to
+    charset_normalizer if inconclusive.
     """
     samples = _read_samples(filepath)
     total = sum(len(s) for s in samples)
 
-    # Try UTF-8 first.
-    # If clean: definitely UTF-8.
-    # If dirty with U+FFFD but still has CJK chars: it's probably damaged
-    # UTF-8 (or double-encoded), not pure GBK. Using GBK on these produces
-    # artifact characters. Only fall to GBK when UTF-8 has essentially
-    # zero CJK.
+    # Step 1: strict UTF-8 (sample-edge tolerant). Success means the
+    # bytes are valid UTF-8 — even if U+FFFD chars are already present
+    # (damaged content saved as UTF-8). Never let the GBK candidates
+    # reinterpret valid UTF-8 into artifact characters.
     try:
-        text = "".join(_decode_utf8_tolerant(s) for s in samples)
-        if "�" not in text:
-            return "utf-8"
+        "".join(_decode_utf8_tolerant(s) for s in samples)
+        return "utf-8"
     except UnicodeDecodeError:
-        # UTF-8 strict decode failed. Check if errors=replace still
-        # recovers meaningful CJK — double-encoded GBK files masquerading
-        # as valid GBK will produce garbage when decoded as GBK, so
-        # preferring UTF-8+replace is the safer choice.
-        text = "".join(s.decode("utf-8", errors="replace") for s in samples)
-        ch = sum(1 for c in text if 0x4E00 <= ord(c) <= 0x9FA5)
-        if ch > total * CJK_RATIO_UTF8_MIN:
-            return "utf-8"
+        pass
+
+    # Step 2: damaged UTF-8? UTF-8+replace recovers CJK with very few
+    # U+FFFD (only at the damage points). A GBK-family file decoded as
+    # UTF-8 also leaks some accidental CJK (BIG5 ~2%), but produces
+    # masses of U+FFFD (~45%) — the FFFD ratio separates the two.
+    # Preferring UTF-8+replace for genuinely damaged files avoids
+    # turning double-encoded GBK content into artifact characters.
+    text = "".join(s.decode("utf-8", errors="replace") for s in samples)
+    ch = sum(1 for c in text if 0x4E00 <= ord(c) <= 0x9FA5)
+    fffd = text.count(chr(0xFFFD))
+    if (ch > total * CJK_RATIO_UTF8_MIN
+            and fffd < total * FFFD_RATIO_UTF8_MAX):
+        return "utf-8"
 
     # UTF-8 gave no meaningful CJK — try GBK/GB18030/BIG5
     candidates = ["gb18030", "gbk", "big5"]

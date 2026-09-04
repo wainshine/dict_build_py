@@ -277,6 +277,30 @@ def test_detect_encoding_utf8_short():
         assert _detect_file_encoding(path) == "utf-8"
 
 
+def test_detect_encoding_big5():
+    """BIG5 bytes leak ~2% accidental CJK when decoded as UTF-8+replace;
+    the FFFD-ratio guard must keep them from being misread as UTF-8."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _make_text_file(
+            tmp, "big5.txt",
+            "臺灣繁體中文測試資料天地玄黃宇宙洪荒日月盈昃辰宿列張\n" * 60,
+            encoding="big5",
+        )
+        assert _detect_file_encoding(path) == "big5"
+
+
+def test_detect_encoding_damaged_utf8():
+    """A UTF-8 file with a few corrupted bytes must stay UTF-8."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "damaged.txt")
+        data = ("天下太平万物安宁天地玄黄宇宙洪荒日月盈昃辰宿列张\n"
+                * 60).encode("utf-8")
+        data = data[:1000] + b"\xff\xfe\x88" + data[1003:]
+        with open(path, "wb") as f:
+            f.write(data)
+        assert _detect_file_encoding(path) == "utf-8"
+
+
 def test_detect_encoding_utf8_no_chinese():
     with tempfile.TemporaryDirectory() as tmp:
         path = _make_text_file(tmp, "ascii.txt", "hello world\nfoo bar\n" * 20)
@@ -378,6 +402,30 @@ def test_compute_entropy_from_sorted_list():
         words = {r[0] for r in results}
         assert "天下" in words
         assert "天地" in words
+
+
+# ============================================================
+# parallel entropy path (normally >1GB; called directly here)
+# ============================================================
+
+def test_write_entropy_from_ngram_parallel():
+    """Split + parallel entropy computation on a sorted n-gram file."""
+    from dict_build.pipeline import _write_entropy_from_ngram_parallel
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "ngrams.txt")
+        with open(src, "w", encoding="utf-8") as f:
+            f.write("天下\t太\n天下\t下\n天地\t玄\n天地\t黄\n")
+        out = os.path.join(tmp, "entropy.txt")
+        count = _write_entropy_from_ngram_parallel(
+            src, out, min_freq=1, direct=True, workers=2,
+        )
+        assert count == 2
+        results = list(read_entropy_from_file(out))
+        assert {r[0] for r in results} == {"天下", "天地"}
+        # still globally sorted by word after the merge
+        assert [r[0] for r in results] == sorted(
+            (r[0] for r in results), key=lambda s: s.encode("utf-8"))
 
 
 # ============================================================
@@ -520,6 +568,25 @@ def test_extract_words_blocklist():
         assert "你好" in words
         assert "锟斤拷" not in words
         assert "烫烫烫工程" not in words
+
+
+def test_extract_words_sorted_by_freq_desc():
+    """extract_words output must be sorted by frequency, descending."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ef = os.path.join(tmp, "entropy.txt")
+        with open(ef, "w") as f:
+            f.write("你好\t10\t3.0\n世界\t4\t2.5\n你\t5\t0.0\n好\t3\t0.0\n"
+                    "世\t6\t0.0\n界\t7\t0.0\n")
+        tf = os.path.join(tmp, "freq.trie")
+        trie, total = build_and_mmap_trie(ef, tf, min_freq=2)
+        pp = {"你": (0.5, 0.5, 0.5), "好": (0.5, 0.5, 0.5),
+              "世": (0.5, 0.5, 0.5), "界": (0.5, 0.5, 0.5)}
+        merged = [("世界", 4, 2.5), ("你好", 10, 3.0)]  # ascending input
+        results = extract_words(merged, pp, trie, total,
+                                pmi_threshold=0, pos_threshold=0)
+        freqs = [r[1] for r in results]
+        assert freqs == sorted(freqs, reverse=True)
+        assert results[0][0] == "你好"
 
 
 # ============================================================
